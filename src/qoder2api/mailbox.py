@@ -29,17 +29,122 @@ from typing import Any, Callable
 
 import httpx
 
-from .env import (
-    cf_temp_email_admin_password,
-    cf_temp_email_base,
-    cf_temp_email_cf_token,
-    cf_temp_email_domain,
-    cf_temp_email_site_password,
-    httpx_client_kwargs,
-    mail_provider,
-    yyds_api_base,
-    yyds_api_key,
-)
+from .database import get_db
+from .env import dotenv_value, httpx_client_kwargs
+
+# ---------------------------------------------------------------------------
+# 配置来源
+#
+# 数据库优先（控制台可在线修改并立即生效），环境变量 / .env 作为回退。
+# 这样改一个域名或密钥不必去改 .env 再重启服务。
+# ---------------------------------------------------------------------------
+YYDS_DEFAULT_BASE = "https://maliapi.215.im/v1"
+
+# 配置项 -> 环境变量名（数据库中统一加 mail_ 前缀存放）
+SETTING_ENV: dict[str, str] = {
+    "provider": "QODER_MAIL_PROVIDER",
+    "cf_base": "CF_TEMP_EMAIL_BASE",
+    "cf_admin_password": "CF_TEMP_EMAIL_ADMIN_PASSWORD",
+    "cf_site_password": "CF_TEMP_EMAIL_SITE_PASSWORD",
+    "cf_domain": "CF_TEMP_EMAIL_DOMAIN",
+    "cf_cf_token": "CF_TEMP_EMAIL_CF_TOKEN",
+    "yyds_api_key": "YYDS_API_KEY",
+    "yyds_api_base": "YYDS_API_BASE",
+}
+
+# 敏感项：回传控制台时只给掩码，绝不返回明文
+SECRET_SETTINGS = ("cf_admin_password", "cf_site_password", "cf_cf_token", "yyds_api_key")
+
+_DB_PREFIX = "mail_"
+
+
+def _db_value(key: str) -> str | None:
+    """读取数据库中的覆盖值；不存在或为空则返回 None。"""
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (_DB_PREFIX + key,)
+            ).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    value = (row[0] or "").strip()
+    return value or None
+
+
+def _cfg(key: str) -> str | None:
+    """读取配置：数据库（控制台）优先，其次环境变量 / .env。"""
+    return _db_value(key) or dotenv_value(SETTING_ENV[key])
+
+
+def set_setting(key: str, value: str | None) -> None:
+    """写入或清除配置；空值表示删除覆盖，回退到环境变量。"""
+    if key not in SETTING_ENV:
+        raise KeyError(f"未知配置项: {key}")
+    with get_db() as conn:
+        if value is None or not str(value).strip():
+            conn.execute("DELETE FROM settings WHERE key = ?", (_DB_PREFIX + key,))
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (_DB_PREFIX + key, str(value).strip()),
+            )
+
+
+def _mask(value: str | None) -> str:
+    if not value:
+        return ""
+    if len(value) <= 4:
+        return "****"
+    return "****" + value[-4:]
+
+
+def describe_config() -> dict[str, Any]:
+    """供控制台读取：敏感项只返回掩码与是否已设置。"""
+    items: dict[str, Any] = {}
+    for key, env_name in SETTING_ENV.items():
+        value = _cfg(key)
+        from_db = _db_value(key) is not None
+        items[key] = {
+            "env_var": env_name,
+            "source": "database" if from_db else ("env" if value else "unset"),
+            "secret": key in SECRET_SETTINGS,
+            "set": bool(value),
+            "value": _mask(value) if key in SECRET_SETTINGS else (value or ""),
+        }
+    try:
+        items["_active_provider"] = active_provider()
+    except RuntimeError:
+        items["_active_provider"] = None
+    return items
+
+
+def update_config(payload: dict[str, Any]) -> dict[str, Any]:
+    """供控制台保存。
+
+    敏感项的语义（避免表单留空时误删已有密钥）：
+      - 字段不存在      -> 不修改
+      - 值为 None       -> 清除该项
+      - 值为空字符串    -> 不修改（用户没填）
+      - 值为非空字符串  -> 写入
+    """
+    changed: list[str] = []
+    for key in SETTING_ENV:
+        if key not in payload:
+            continue
+        raw = payload[key]
+        if key in SECRET_SETTINGS:
+            if raw is None:
+                set_setting(key, None)
+                changed.append(key)
+            elif str(raw).strip():
+                set_setting(key, str(raw))
+                changed.append(key)
+            continue
+        set_setting(key, None if raw is None else str(raw))
+        changed.append(key)
+    return {"updated": changed}
 
 # Qoder 邮箱验证码为 6 位纯数字
 CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
@@ -112,7 +217,7 @@ def extract_code(msg: dict[str, Any] | None) -> str | None:
 # cloudflare_temp_email
 # ---------------------------------------------------------------------------
 def _cf_base() -> str:
-    base = cf_temp_email_base()
+    base = _cfg("cf_base")
     if not base:
         raise RuntimeError(
             "CF_TEMP_EMAIL_BASE 未配置：请设置为 cloudflare_temp_email 部署地址，"
@@ -123,11 +228,11 @@ def _cf_base() -> str:
 
 def _cf_headers(token: str = "", admin: bool = False) -> dict[str, str]:
     headers = {"Accept": "application/json"}
-    site_password = cf_temp_email_site_password()
+    site_password = _cfg("cf_site_password")
     if site_password:
         headers["x-custom-auth"] = site_password
     if admin:
-        admin_password = cf_temp_email_admin_password()
+        admin_password = _cfg("cf_admin_password")
         if admin_password:
             headers["x-admin-auth"] = admin_password
     elif token:
@@ -150,15 +255,15 @@ def _cf_unwrap(payload: Any) -> dict[str, Any]:
 
 def _cf_create(prefix: str, task_id: str | None, log: Logger | None) -> Mailbox:
     base = _cf_base()
-    admin_password = cf_temp_email_admin_password()
+    admin_password = _cfg("cf_admin_password")
     use_admin = bool(admin_password)
 
     name = f"{prefix}{uuid.uuid4().hex[:8]}"
     body: dict[str, Any] = {"name": name, "enableRandomSubdomain": False}
-    domain = cf_temp_email_domain()
+    domain = _cfg("cf_domain")
     if domain:
         body["domain"] = domain
-    turnstile = cf_temp_email_cf_token()
+    turnstile = _cfg("cf_cf_token")
     if turnstile:
         body["cf_token"] = turnstile
 
@@ -237,14 +342,14 @@ def _cf_fetch_code(mailbox: Mailbox, seen: set[Any], task_id: str | None, log: L
 # yyds（maliapi.215.im）
 # ---------------------------------------------------------------------------
 def _yyds_create(prefix: str, task_id: str | None, log: Logger | None) -> Mailbox:
-    key = yyds_api_key()
+    key = _cfg("yyds_api_key")
     if not key:
         raise RuntimeError(
             "YYDS_API_KEY 未配置：请在项目根 .env 或系统环境变量中设置 YYDS_API_KEY（AC- 开头）"
         )
     local = f"{prefix}{uuid.uuid4().hex[:8]}"
     response = httpx.post(
-        f"{yyds_api_base()}/accounts",
+        f"{(_cfg('yyds_api_base') or YYDS_DEFAULT_BASE)}/accounts",
         headers={"X-API-Key": key, "Content-Type": "application/json"},
         json={"localPart": local},
         timeout=20,
@@ -257,9 +362,9 @@ def _yyds_create(prefix: str, task_id: str | None, log: Logger | None) -> Mailbo
 
 
 def _yyds_fetch_code(mailbox: Mailbox, task_id: str | None, log: Logger | None) -> str | None:
-    key = yyds_api_key() or mailbox.token
+    key = _cfg("yyds_api_key") or mailbox.token
     response = httpx.get(
-        f"{yyds_api_base()}/messages/next",
+        f"{(_cfg('yyds_api_base') or YYDS_DEFAULT_BASE)}/messages/next",
         params={"address": mailbox.address, "wait": 30},
         headers={"X-API-Key": key},
         timeout=45,
@@ -282,7 +387,7 @@ def _yyds_fetch_code(mailbox: Mailbox, task_id: str | None, log: Logger | None) 
 # ---------------------------------------------------------------------------
 def active_provider() -> str:
     """解析实际使用的 provider（auto 时按配置可用性决定）。"""
-    configured = (mail_provider() or "auto").strip().lower()
+    configured = ((_cfg("provider") or "auto") or "auto").strip().lower()
     if configured in ("cloudflare", "cf", "cf_temp_email"):
         return "cloudflare"
     if configured == "yyds":
@@ -291,9 +396,9 @@ def active_provider() -> str:
         raise RuntimeError(
             f"QODER_MAIL_PROVIDER 取值非法: {configured}（可选 auto | cloudflare | yyds）"
         )
-    if cf_temp_email_base():
+    if _cfg("cf_base"):
         return "cloudflare"
-    if yyds_api_key():
+    if _cfg("yyds_api_key"):
         return "yyds"
     raise RuntimeError(
         "未配置任何邮件后端：请设置 CF_TEMP_EMAIL_BASE（cloudflare_temp_email）"
@@ -364,12 +469,12 @@ def yyds_wait_code(address: str, task_id: str | None = None, timeout: float = 12
 def probe() -> dict[str, Any]:
     """诊断当前邮件配置，供 --check / 控制台展示。"""
     info: dict[str, Any] = {
-        "configured_provider": mail_provider(),
-        "cf_base": cf_temp_email_base(),
-        "cf_admin": bool(cf_temp_email_admin_password()),
-        "cf_site_password": bool(cf_temp_email_site_password()),
-        "cf_domain": cf_temp_email_domain(),
-        "yyds_key": bool(yyds_api_key()),
+        "configured_provider": (_cfg("provider") or "auto"),
+        "cf_base": _cfg("cf_base"),
+        "cf_admin": bool(_cfg("cf_admin_password")),
+        "cf_site_password": bool(_cfg("cf_site_password")),
+        "cf_domain": _cfg("cf_domain"),
+        "yyds_key": bool(_cfg("yyds_api_key")),
     }
     try:
         info["active_provider"] = active_provider()

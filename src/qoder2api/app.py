@@ -27,7 +27,7 @@ from .accounts import (
     batch_import_accounts,
 )
 from .registrar import get_registrar_status, start_registration, stop_registration
-from . import remotebrowser
+from . import mailbox, remotebrowser
 from .tokens import (
     refresh_all_account_tokens,
     refresh_one_account,
@@ -293,6 +293,45 @@ async def get_logs(verify: None = Depends(check_gateway_token)) -> list[str]:
 # ---------------------------------------------------------------------------
 # 远程浏览器：在控制台里直接查看/操作注册机的 Chromium（无需 VNC）
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 临时邮箱配置：控制台在线修改（存 SQLite，保存即生效，无需重启）
+# ---------------------------------------------------------------------------
+@app.get("/ui/mail-config")
+async def get_mail_config(verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    """读取临时邮箱配置。敏感项（密码/token）只返回掩码，不回传明文。"""
+    return mailbox.describe_config()
+
+
+@app.post("/ui/mail-config")
+async def post_mail_config(
+    payload: dict[str, Any],
+    verify: None = Depends(check_gateway_token),
+) -> dict[str, Any]:
+    """保存临时邮箱配置。
+
+    敏感项语义：字段缺省=不修改；空字符串=不修改（表单留空）；
+    null=清除该项。避免用户没填密码时误删已有配置。
+    """
+    try:
+        result = mailbox.update_config(payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    add_log(f"Mail config updated: {', '.join(result['updated']) or '(none)'}")
+    return {"status": "ok", **result}
+
+
+@app.post("/ui/mail-config/test")
+async def test_mail_config(verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    """按当前配置真实创建一个临时邮箱，用于验证配置是否正确。"""
+    try:
+        box = await asyncio.to_thread(mailbox.create_mailbox, "qodertest", None, None)
+    except Exception as exc:
+        add_log(f"Mail config test failed: {exc}", "WARNING")
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    add_log(f"Mail config test ok: {box.address} via {box.provider}")
+    return {"ok": True, "address": box.address, "provider": box.provider}
+
+
 @app.get("/ui/remote-browser")
 async def remote_browser_info(verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
     """列出可投屏的浏览器任务与当前配置。"""

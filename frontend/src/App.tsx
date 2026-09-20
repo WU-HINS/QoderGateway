@@ -385,6 +385,202 @@ function RemoteBrowserPanel({ token, lang }: { token: string | null; lang: 'en' 
   )
 }
 
+
+// ───────────────────────────────────────────────────────────────────────────
+// 临时邮箱配置面板：在控制台里在线修改，写入 SQLite 后立即生效，无需重启。
+// 敏感项（密码/Token）后端只回传掩码，留空表示不修改。
+// ───────────────────────────────────────────────────────────────────────────
+interface MailSetting {
+  env_var: string
+  source: 'database' | 'env' | 'unset'
+  secret: boolean
+  set: boolean
+  value: string
+}
+
+const MAIL_FIELDS: { key: string; zh: string; en: string; ph?: string }[] = [
+  { key: 'cf_base', zh: '部署地址', en: 'Base URL', ph: 'https://mail.example.com' },
+  { key: 'cf_admin_password', zh: '管理员密码', en: 'Admin password' },
+  { key: 'cf_site_password', zh: '站点密码', en: 'Site password' },
+  { key: 'cf_domain', zh: '指定域名', en: 'Domain', ph: 'mail.example.com' },
+  { key: 'cf_cf_token', zh: 'Turnstile Token', en: 'Turnstile token' },
+  { key: 'yyds_api_key', zh: 'YYDS API Key', en: 'YYDS API Key' },
+  { key: 'yyds_api_base', zh: 'YYDS 基址', en: 'YYDS base URL', ph: 'https://maliapi.215.im/v1' },
+]
+
+function MailConfigPanel({ token, lang }: { token: string | null; lang: 'en' | 'zh' }) {
+  const zh = lang === 'zh'
+  const [open, setOpen] = useState(false)
+  const [cfg, setCfg] = useState<Record<string, MailSetting>>({})
+  const [active, setActive] = useState<string | null>(null)
+  const [form, setForm] = useState<Record<string, string>>({})
+  const [provider, setProvider] = useState<string>('auto')
+  const [saving, setSaving] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [msg, setMsg] = useState('')
+  const [msgOk, setMsgOk] = useState(true)
+
+  const L = {
+    title: zh ? '临时邮箱配置' : 'Temp mail configuration',
+    hint: zh
+      ? '设置保存在本地数据库，保存后立即生效，无需重启。密码类字段留空表示不修改。'
+      : 'Saved to the local database and applied immediately. Leave secret fields blank to keep the current value.',
+    provider: zh ? '后端' : 'Provider',
+    save: zh ? '保存' : 'Save',
+    test: zh ? '测试连接' : 'Test',
+    testing: zh ? '测试中…' : 'Testing…',
+    saved: zh ? '已保存' : 'Saved',
+    failed: zh ? '保存失败' : 'Save failed',
+    fromDb: zh ? '控制台' : 'console',
+    fromEnv: zh ? '环境变量' : 'env',
+    unset: zh ? '未设置' : 'unset',
+    set: zh ? '已设置' : 'set',
+  }
+
+  const load = useCallback(async () => {
+    if (!token) return
+    try {
+      const resp = await fetch('/ui/mail-config', { headers: { 'X-Gateway-Token': token } })
+      if (!resp.ok) return
+      const data = await resp.json()
+      const items: Record<string, MailSetting> = {}
+      for (const f of MAIL_FIELDS) if (data[f.key]) items[f.key] = data[f.key]
+      setCfg(items)
+      setActive(data._active_provider ?? null)
+      setProvider(data.provider?.value || 'auto')
+    } catch { /* ignore */ }
+  }, [token])
+
+  useEffect(() => { if (open) load() }, [open, load])
+
+  const sourceTag = (s?: MailSetting) => {
+    if (!s || s.source === 'unset') return <span className="text-[10px] text-neutral-400">{L.unset}</span>
+    if (s.source === 'database') return <span className="text-[10px] text-emerald-600">{L.fromDb}</span>
+    return <span className="text-[10px] text-amber-600">{L.fromEnv}</span>
+  }
+
+  const save = async () => {
+    if (!token) return
+    setSaving(true); setMsg('')
+    const payload: Record<string, string> = { provider }
+    for (const f of MAIL_FIELDS) {
+      const v = form[f.key]
+      if (v === undefined) continue
+      // 敏感项：留空不发送（后端保持原值）；非敏感项：允许清空
+      if (cfg[f.key]?.secret && v.trim() === '') continue
+      payload[f.key] = v
+    }
+    try {
+      const resp = await fetch('/ui/mail-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Gateway-Token': token },
+        body: JSON.stringify(payload),
+      })
+      const data = await resp.json()
+      if (resp.ok) {
+        setMsgOk(true); setMsg(L.saved)
+        setForm({}); await load()
+      } else {
+        setMsgOk(false); setMsg(data.detail || L.failed)
+      }
+    } catch (e) { setMsgOk(false); setMsg(String(e)) } finally { setSaving(false) }
+  }
+
+  const test = async () => {
+    if (!token) return
+    setTesting(true); setMsg('')
+    try {
+      const resp = await fetch('/ui/mail-config/test', {
+        method: 'POST', headers: { 'X-Gateway-Token': token },
+      })
+      const data = await resp.json()
+      if (data.ok) {
+        setMsgOk(true); setMsg((zh ? '创建成功：' : 'Created: ') + data.address + ' (' + data.provider + ')')
+      } else {
+        setMsgOk(false); setMsg(data.error || 'failed')
+      }
+    } catch (e) { setMsgOk(false); setMsg(String(e)) } finally { setTesting(false) }
+  }
+
+  return (
+    <div className="bg-white/70 backdrop-blur-xl border border-hairline rounded-2xl overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className="w-full px-6 py-4 flex items-center justify-between gap-3 text-left"
+      >
+        <div className="flex items-center gap-2">
+          <span className="material-symbols-outlined text-base text-ink">mail</span>
+          <span className="text-sm font-semibold text-ink">{L.title}</span>
+          {active && (
+            <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-neutral-100 text-neutral-600">{active}</span>
+          )}
+        </div>
+        <span className="material-symbols-outlined text-base text-body">{open ? 'expand_less' : 'expand_more'}</span>
+      </button>
+
+      {open && (
+        <div className="px-6 pb-6 space-y-4">
+          <div className="text-xs text-body">{L.hint}</div>
+
+          <div>
+            <label className="text-[11px] font-semibold text-body uppercase opacity-60 tracking-wider">{L.provider}</label>
+            <select
+              value={provider}
+              onChange={(e) => setProvider(e.target.value)}
+              className="mt-1 w-full h-10 px-3 rounded-lg border border-hairline bg-white text-sm text-ink"
+            >
+              <option value="auto">auto</option>
+              <option value="cloudflare">cloudflare_temp_email</option>
+              <option value="yyds">yyds</option>
+            </select>
+          </div>
+
+          {MAIL_FIELDS.map(f => {
+            const s = cfg[f.key]
+            const label = zh ? f.zh : f.en
+            const ph = s?.secret && s.set ? s.value : (f.ph || '')
+            return (
+              <div key={f.key}>
+                <div className="flex items-center justify-between">
+                  <label className="text-[11px] font-semibold text-body uppercase opacity-60 tracking-wider">{label}</label>
+                  <div className="flex items-center gap-2">{sourceTag(s)}</div>
+                </div>
+                <input
+                  type="text"
+                  value={form[f.key] ?? ''}
+                  placeholder={ph}
+                  onChange={(e) => setForm(prev => ({ ...prev, [f.key]: e.target.value }))}
+                  className="mt-1 w-full h-10 px-3 rounded-lg border border-hairline bg-white text-sm text-ink font-mono"
+                />
+              </div>
+            )
+          })}
+
+          <div className="flex items-center gap-3 flex-wrap">
+            <button
+              onClick={save}
+              disabled={saving}
+              className={'h-10 px-5 rounded-lg text-xs font-bold ' + (saving ? 'bg-neutral-300 text-neutral-500' : 'bg-ink text-white hover:bg-neutral-800')}
+            >
+              {saving ? '…' : L.save}
+            </button>
+            <button
+              onClick={test}
+              disabled={testing}
+              className={'h-10 px-5 rounded-lg text-xs font-bold border border-hairline ' + (testing ? 'text-neutral-400' : 'text-ink hover:bg-neutral-50')}
+            >
+              {testing ? L.testing : L.test}
+            </button>
+            {msg && (
+              <span className={'text-xs ' + (msgOk ? 'text-emerald-600' : 'text-red-600')}>{msg}</span>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
 // ─── Custom UI Components ───
 
 function CustomCheckbox({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: string }) {
@@ -1544,7 +1740,10 @@ export default function App() {
                 </div>
               )}
 
-              {/* 远程浏览器：直接在控制台完成人机验证，无需 VNC */}
+              {/* 临时邮箱配置：在线修改，保存即生效 */}
+              <MailConfigPanel token={token} lang={lang} />
+
+              {/* 远程浏览器：直接在控制台完成人机验证 */}
               <RemoteBrowserPanel token={token} lang={lang} />
 
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
