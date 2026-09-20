@@ -46,6 +46,22 @@ def proxy_url() -> str | None:
     return value or None
 
 
+def mail_proxy_url() -> str | None:
+    """临时邮箱请求专用代理（QODER_MAIL_PROXY）。
+
+    刻意与 QODER_PROXY 分离：后者是为访问 qoder.sh 配的（国内必需），
+    而自建的 cloudflare_temp_email 通常可以直连；把它一起挂到 qoder 的代理上，
+    会因代理主机名在容器内不可解析而报 DNS 失败。
+    未设置时邮箱请求直连。
+    """
+    return dotenv_value("QODER_MAIL_PROXY")
+
+
+def mail_httpx_kwargs() -> dict:
+    """临时邮箱请求的 httpx 参数：默认直连，仅 QODER_MAIL_PROXY 可改变。"""
+    return {"proxy": mail_proxy_url(), "trust_env": False}
+
+
 def httpx_client_kwargs() -> dict:
     """出站 httpx 参数：仅由 QODER_PROXY 决定是否走代理。
 

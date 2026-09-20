@@ -30,7 +30,7 @@ from typing import Any, Callable
 import httpx
 
 from .database import get_db
-from .env import dotenv_value, httpx_client_kwargs
+from .env import dotenv_value, mail_httpx_kwargs
 
 # ---------------------------------------------------------------------------
 # 配置来源
@@ -273,7 +273,7 @@ def _cf_create(prefix: str, task_id: str | None, log: Logger | None) -> Mailbox:
         json=body,
         headers=_cf_headers(admin=use_admin),
         timeout=25,
-        **httpx_client_kwargs(),
+        **mail_httpx_kwargs(),
     )
     if response.status_code != 200:
         raise RuntimeError(
@@ -304,7 +304,7 @@ def _cf_fetch_code(mailbox: Mailbox, seen: set[Any], task_id: str | None, log: L
         params={"limit": 20, "offset": 0},
         headers=_cf_headers(mailbox.token),
         timeout=25,
-        **httpx_client_kwargs(),
+        **mail_httpx_kwargs(),
     )
     if response.status_code == 401:
         raise RuntimeError(
@@ -353,7 +353,7 @@ def _yyds_create(prefix: str, task_id: str | None, log: Logger | None) -> Mailbo
         headers={"X-API-Key": key, "Content-Type": "application/json"},
         json={"localPart": local},
         timeout=20,
-        **httpx_client_kwargs(),
+        **mail_httpx_kwargs(),
     )
     response.raise_for_status()
     address = response.json()["data"]["address"]
@@ -368,7 +368,7 @@ def _yyds_fetch_code(mailbox: Mailbox, task_id: str | None, log: Logger | None) 
         params={"address": mailbox.address, "wait": 30},
         headers={"X-API-Key": key},
         timeout=45,
-        **httpx_client_kwargs(),
+        **mail_httpx_kwargs(),
     )
     if response.status_code == 200:
         msg = response.json().get("data", {}).get("message")
