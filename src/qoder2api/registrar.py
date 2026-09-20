@@ -333,12 +333,16 @@ class RegistrarBot:
             _log(task_id, "  4) 确认 /usr/bin/chromium 可执行且未被安全策略拦截")
             raise
 
-    # ---- 窗口控制（平时隐藏后台，人机验证置顶一次） ----
+    # ---- 窗口控制 ----
     #
-    # Windows: 用 win32gui 精确置顶。
-    # Linux  : 通常运行在 Xvfb 虚拟屏上，没有真实窗口管理器，置顶无意义，
-    #          改为把窗口最大化并居中，便于通过 VNC 观察和操作滑块。
+    # DrissionPage 的窗口控制方法在 Linux 上支持不完整，部分会抛
+    # "This method can be used only on Windows"（如 hide/show）。
+    # 容器里窗口跑在 Xvfb 虚拟屏上，本就没有真实桌面的可见性可言，
+    # 因此按平台分支：Windows 做真正的隐藏/置顶；Linux 只做尽力而为的
+    # 最大化，任何失败都静默忽略——窗口尺寸不影响 CDP 画面与事件注入。
     def window_hide(self) -> None:
+        if sys.platform != "win32":
+            return  # Linux 不支持隐藏，虚拟屏上也无意义
         try:
             self.page.set.window.hide()
             _log(self.task_id, "[browser] window hidden")
@@ -346,23 +350,25 @@ class RegistrarBot:
             _log(self.task_id, f"[browser] hide error: {e}")
 
     def window_show_top(self) -> None:
-        try:
-            self.page.set.window.show()
-        except Exception:
-            pass
         if sys.platform == "win32":
+            try:
+                self.page.set.window.show()
+            except Exception:
+                pass
             self._window_top_windows()
         else:
             self._window_focus_linux()
 
     def _window_focus_linux(self) -> None:
-        """Linux/Xvfb：最大化并居中，方便 VNC 里操作滑块。"""
+        """Linux/Xvfb：尽力最大化窗口，便于在控制台画面里操作滑块。
+
+        该方法在 Linux 上可能不可用，失败即静默忽略。
+        """
         try:
             self.page.set.window.max()
-            self.page.set.window.normal()
-            _log(self.task_id, "[browser] window maximized (Xvfb/VNC)")
-        except Exception as e:
-            _log(self.task_id, f"[browser] maximize error: {e}")
+            _log(self.task_id, "[browser] window maximized")
+        except Exception:
+            pass
 
     def _window_top_windows(self) -> None:
         try:
