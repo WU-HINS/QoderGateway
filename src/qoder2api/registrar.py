@@ -66,6 +66,9 @@ BROWSER_CONNECT_RETRY = (10, 3)
 # 并发越高磁盘压力越大；机械硬盘上建议保持 1~3。
 BROWSER_WORKERS_PER_PARENT = 3
 
+# 人机验证的等待上限（秒）。超时后会打印诊断信息，而不是静默继续。
+SLIDER_WAIT_TIMEOUT = 300
+
 # 服务状态（单例，多任务）
 _REGISTRAR: dict[str, Any] = {
     "running": False,
@@ -269,6 +272,50 @@ def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+OTP_SELECTOR = 'css:input[aria-label^="OTP Input"]'
+
+
+def _find_otp_input(page: Any) -> Any:
+    """在主页与各 iframe 中查找 OTP 输入框。
+
+    验证通过后 OTP 输入框未必出现在主文档里——也可能落在某个 iframe 中，
+    只查主页面会一直等不到，表现为「验证完成了但状态不更新」。
+    """
+    try:
+        element = page.ele(OTP_SELECTOR, timeout=0)
+        if element:
+            return element
+    except Exception:
+        pass
+    try:
+        for frame in page.get_frames():
+            try:
+                element = frame.ele(OTP_SELECTOR, timeout=0)
+                if element:
+                    return element
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _describe_inputs(page: Any, task_id: str, limit: int = 8) -> None:
+    """把页面上的 input 概况写进日志，便于判断是不是选择器过期。"""
+    try:
+        inputs = page.eles("tag:input")[:limit]
+    except Exception:
+        return
+    _log(task_id, f"[verify] 当前页面共 {len(inputs)} 个 input（最多列 {limit} 个）：")
+    for index, element in enumerate(inputs):
+        try:
+            _log(task_id, f"[verify]   [{index}] id={element.attr('id')!r} "
+                          f"type={element.attr('type')!r} "
+                          f"aria-label={element.attr('aria-label')!r}")
+        except Exception:
+            continue
 
 
 # ---------------------------------------------------------------------------
@@ -534,25 +581,37 @@ class RegistrarBot:
         self.window_show_top()
         _log(tid, ">>> 请在本机浏览器完成人机验证（窗口已置顶）<<<")
         try:
-            otp_deadline = time.time() + 300
+            deadline = time.time() + SLIDER_WAIT_TIMEOUT
             otp_seen = False
-            while time.time() < otp_deadline:
+            jumped = False
+            last_report = 0.0
+            while time.time() < deadline:
                 if _REGISTRAR["stop_requested"]:
                     raise RuntimeError("用户请求停止注册")
-                try:
-                    if page.ele('css:input[aria-label^="OTP Input"]', timeout=2):
-                        otp_seen = True
-                        break
-                except Exception:
-                    pass
-                if SUCCESS_URL_MARK in page.url:
-                    otp_seen = False  # 直接跳转，无需 OTP
+                # OTP 可能出现在主文档，也可能在某个 iframe 里
+                if _find_otp_input(page):
+                    otp_seen = True
                     break
+                if SUCCESS_URL_MARK in page.url:
+                    jumped = True
+                    break
+                now = time.time()
+                if now - last_report >= 15:
+                    last_report = now
+                    _log(tid, f"[verify] 等待验证通过… 剩余 {int(deadline - now)}s "
+                              f"url={page.url[:70]}")
                 time.sleep(0.5)
+
             if otp_seen:
                 _log(tid, "[reg] OTP input appeared")
-            else:
+            elif jumped:
                 _log(tid, "[reg] page jumped directly to download (no OTP)")
+            else:
+                # 此前这里把「超时」误报成「直接跳转，无需 OTP」，
+                # 掩盖了验证其实没有通过的事实，导致后续流程白等验证码。
+                _log(tid, f"[verify] 等待验证通过超时（{SLIDER_WAIT_TIMEOUT}s）", "WARNING")
+                _log(tid, f"[verify] 当前 url={page.url[:100]}", "WARNING")
+                _describe_inputs(page, tid)
         finally:
             self.window_hide()
             self.vq.release(tid)
@@ -561,13 +620,13 @@ class RegistrarBot:
         _set_task(tid, "waiting_otp")
         code = yyds_wait_code(address, task_id=tid, timeout=120)
 
-        otp_inputs = page.eles('css:input[aria-label^="OTP Input"]')
+        otp_inputs = page.eles(OTP_SELECTOR)
         if otp_inputs:
             for i, ch in enumerate(code[: len(otp_inputs)]):
                 otp_inputs[i].input(ch)
             _log(tid, f"[reg] OTP filled: {code}")
         else:
-            self._locate('css:input[aria-label^="OTP Input"]', desc="OTP 输入框").input(code)
+            self._locate(OTP_SELECTOR, desc="OTP 输入框").input(code)
 
         deadline = time.time() + 30
         while time.time() < deadline:
