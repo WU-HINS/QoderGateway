@@ -42,7 +42,21 @@ CONSOLE_HTML = Path(BASE_DIR) / "static" / "console.html"
 DOCS_HTML = Path(BASE_DIR) / "static" / "docs.html"
 
 app = FastAPI(title="qoder2api-python")
-app.mount("/assets", StaticFiles(directory=os.path.join(BASE_DIR, "static", "assets")), name="assets")
+
+# 静态资源只有在前端构建后（frontend/npm run build）才存在。
+# 这里刻意不做无条件 mount：StaticFiles 默认 check_dir=True，目录缺失时会在
+# 导入期直接抛 RuntimeError，导致「服务起不来」且报错难以定位。
+# 缺失时降级为警告，API 仍可用，同时给出可操作的提示。
+_static_dir = Path(BASE_DIR) / "static"
+_assets_dir = _static_dir / "assets"
+if _assets_dir.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(_assets_dir)), name="assets")
+else:
+    print(
+        f"[WARNING] 静态资源目录不存在: {_assets_dir}\n"
+        "          WebUI / 文档站将不可用（API 不受影响）。请先构建前端：\n"
+        "            cd frontend && npm install && npm run build"
+    )
 
 _session: SessionContext | None = None
 _local_auth_error: str | None = None

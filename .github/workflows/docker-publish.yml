@@ -110,10 +110,10 @@ jobs:
 
       # build job 在 PR 阶段不运行，workflow 自身的语法错误只能在合并后才暴露，
       # 这里用 actionlint 提前拦截（含表达式语义检查）。
+      # 使用官方 docker 镜像，避免第三方 action 的平台/下载问题。
       - name: Lint workflows
-        uses: raven-actions/actionlint@v2
-        with:
-          fail-on-error: true
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -color
 
       - name: Assert no hardcoded credentials
         run: |
