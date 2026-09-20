@@ -170,6 +170,9 @@ docker run -d --name qodergate \
 - 帧率与画质可调：`QODER_REMOTE_BROWSER_FPS`（默认 8）、`QODER_REMOTE_BROWSER_QUALITY`（默认 60）
 - 关闭该功能：`QODER_REMOTE_BROWSER=0`
 - 必须加 `--shm-size=1g`：默认 64MB 的 `/dev/shm` 会导致 Chromium 渲染进程崩溃
+- **并发建议**：每个子任务都会拉起一个独立 Chromium。机械硬盘或低配环境
+  请保持 `parents=1`（默认值）——并发启动多个浏览器会打满磁盘 IO，
+  进而导致浏览器连接超时（`BrowserConnectError`）
 
 > **安全提示**：远程浏览器等同于把注册机浏览器的完全控制权交给控制台使用者（可访问该浏览器中的所有已登录会话）。请务必修改默认管理员密码，不要将控制台暴露到公网。
 
