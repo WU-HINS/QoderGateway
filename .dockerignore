@@ -1,0 +1,48 @@
+# ---- 版本控制 / CI ----
+.git
+.github
+.gitignore
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# ---- 前端依赖与产物（构建阶段重新安装/生成）----
+frontend/node_modules/
+frontend/dist/
+
+# ---- 前端构建产物（由 build stage 提供，避免拷入陈旧文件）----
+src/qoder2api/static/
+
+# ---- 本地数据 / 凭据（严禁进镜像）----
+*.db
+.env
+scripts/qoder_credentials.json
+scripts/*_result.json
+scripts/.last_profile
+scripts/*.png
+accounts.json
+qodergate-register/accounts.json
+
+# ---- 不参与构建的目录 ----
+# 注意：不可排除 *.md —— frontend/src/docs/*.md 是文档站的构建输入
+# 注意：不可排除 docker/ —— 镜像需要其中的 entrypoint.sh
+docs/
+scripts/
+qodergate-register/
+vitepress-docs/
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+.DS_Store
+
+# ---- 容器自身 ----
+Dockerfile
+docker-compose.yml
+.dockerignore

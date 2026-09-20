@@ -1,0 +1,286 @@
+name: Build and Push Container Image
+
+# 触发策略（一次合并 = 一次镜像构建）：
+#   - PR 到 main   -> 只跑质量门禁（verify + test），不构建镜像
+#   - 合并到 main  -> 构建一次并推送 :edge / :main / :sha
+#   - push tag v*  -> 构建一次并推送版本号标签
+#   - 手动触发     -> 按需构建
+#
+# 说明：PR 阶段不做镜像构建，避免同一次改动在 PR 与合并后各构建一轮；
+# 镜像构建只在代码进入 main（即合并）或打 tag 时发生。
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  # 手动触发：同样执行一次构建并推送
+  workflow_dispatch:
+
+# 注意：镜像名不在此处定义。GHCR 要求全小写，而 github.repository 可能含大写，
+# 因此各 job 通过 "Compute lowercase image name" 步骤归一化后再使用。
+env:
+  REGISTRY: ghcr.io
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # 仅 PR 允许取消旧的运行；
+  # main/tag 不互相取消，确保每次合并都真实产出一个镜像。
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) 构建前端并做静态校验：前端产物缺失会导致镜像启动即失败
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Verify source
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Byte-compile Python sources
+        run: python -m compileall -q src qodergate-register/qodergate_register scripts
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          test -f ../src/qoder2api/static/index.html
+          test -f ../src/qoder2api/static/console.html
+          test -f ../src/qoder2api/static/docs.html
+          test -d ../src/qoder2api/static/assets
+
+      - name: Validate container assets
+        run: |
+          # entrypoint 语法
+          sh -n docker/entrypoint.sh
+          # Dockerfile 引用的路径必须存在
+          test -f docker/entrypoint.sh
+          grep -q "COPY docker/ /app/docker/" Dockerfile
+          # 注册机依赖必须留在可选 extra 中，避免 arm64 构建失败
+          grep -q 'registrar = \[' pyproject.toml
+          if grep -q 'pypiwin32' pyproject.toml qodergate-register/pyproject.toml; then
+            echo "::error::pypiwin32 在 Linux 上无法构建，请使用 pywin32 并加 sys_platform 标记"
+            exit 1
+          fi
+
+          # 镜像必须预装注册机所需的全部运行时组件（缺一即运行期失败）
+          for pkg in chromium xvfb x11vnc novnc websockify openbox xdotool \
+                     fonts-noto-cjk fonts-liberation curl tini procps; do
+            if ! grep -qE "^ +$pkg( |$)" Dockerfile; then
+              echo "::error::Dockerfile 缺少预装依赖: $pkg"
+              exit 1
+            fi
+          done
+
+          # 预装校验必须真实执行（而非只声明）
+          grep -q 'test -f /usr/share/novnc/vnc.html' Dockerfile
+          grep -q 'QODER_CHROMIUM_PATH}" --version' Dockerfile
+
+          # GHCR 要求仓库路径全小写。若直接使用 github.repository 拼镜像名，
+          # 含大写的仓库（如 QoderGateway）会被 docker 以 invalid reference format 拒绝。
+          grep -q 'Compute lowercase image name' .github/workflows/docker-publish.yml || {
+            echo "::error::workflow 缺少镜像名小写归一化步骤"
+            exit 1
+          }
+          # 只匹配表达式用法 ${{ ... }}，避免匹配到提示文本自身
+          if grep -vE '^[[:space:]]*#' .github/workflows/docker-publish.yml \
+               | grep -qE '\$\{\{[^}]*github\.repository|\$\{\{[^}]*env\.IMAGE_NAME'; then
+            echo "::error::检测到未归一化的镜像名表达式，请改用归一化步骤的输出"
+            exit 1
+          fi
+          echo "container assets ok (runtime components preinstalled, image name lowercased)"
+
+      - name: Assert no hardcoded credentials
+        run: |
+          if grep -rnE 'AC-[0-9a-f]{20,}' --include='*.py' --include='*.toml' --include='*.yml' \
+              src scripts qodergate-register .github 2>/dev/null; then
+            echo "::error::发现硬编码密钥，请改为读取环境变量"
+            exit 1
+          fi
+          echo "no hardcoded credentials"
+
+  # ---------------------------------------------------------------------------
+  # 2) 远程浏览器（CDP 画面桥）真实浏览器测试
+  #    用 setup-chrome 提供 Chrome 二进制；环境缺失时用例自动跳过。
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test remote browser bridge
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install project with test extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,registrar]"
+
+      - name: Run tests
+        env:
+          QODER_CHROMIUM_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: pytest tests/ -v
+
+  # ---------------------------------------------------------------------------
+  # 3) 多架构构建：amd64 + arm64，原生 runner 各自构建后合并 manifest
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: [verify, test]
+    # PR 只做质量门禁，不构建镜像；合并到 main 或打 tag 才构建
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          # arm64 用 GitHub 原生 ARM runner，避免 QEMU 模拟拖慢构建
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute lowercase image name
+        id: image
+        # GHCR 要求仓库路径全小写；github.repository 可能含大写（如 QoderGateway），
+        # 直接拼进 name=ghcr.io/... 会被 docker 以 invalid reference format 拒绝。
+        run: |
+          echo "name=ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # 统一使用已归一化的小写镜像名
+          images: ${{ steps.image.outputs.name }}
+          # 仅用于打标签；最终标签在 merge 阶段统一生成
+          flavor: |
+            latest=false
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          # PR 只构建不推送；其余情况按 digest 推送，供 merge 阶段引用
+          # 按 digest 推送，供 merge 阶段合并为多架构 manifest。
+          # 必须写成单行：YAML 折叠块会在换行处插入空格，破坏逗号分隔的参数解析。
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 4) 合并多架构 manifest，生成最终 tag（latest / edge / vX.Y.Z / sha）
+  # ---------------------------------------------------------------------------
+  merge:
+    name: Merge manifest
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Compute lowercase image name
+        id: image
+        # 与 build job 保持一致：GHCR 只接受全小写仓库路径
+        run: |
+          echo "name=ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,format=short
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ steps.image.outputs.name }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect \
+            ${{ steps.image.outputs.name }}:${{ steps.meta.outputs.version }}

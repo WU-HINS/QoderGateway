@@ -1,0 +1,128 @@
+# syntax=docker/dockerfile:1.7
+# ---------------------------------------------------------------------------
+# QoderGateway —— 多阶段构建（含注册机所需的 Chromium）
+#   stage 1 (web-build) : Node 构建 React 前端（landing / console / docs）
+#   stage 2 (runtime)   : Python + Chromium + Xvfb + VNC
+# 支持 linux/amd64 与 linux/arm64（Debian bookworm 的 chromium 两架构齐备）
+# ---------------------------------------------------------------------------
+
+# ============================ stage 1: frontend ============================
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web-build
+WORKDIR /build/frontend
+
+# 先只拷贝清单，最大化利用层缓存
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+# 文档站的 *.md 通过 import.meta.glob 在构建期打包进 JS，
+# 因此 frontend/src/docs/ 必须在构建阶段存在。
+# 产物输出到 ../src/qoder2api/static（见 vite.config.ts）
+COPY frontend/ ./
+RUN mkdir -p /build/src/qoder2api && \
+    npm run build && \
+    test -f /build/src/qoder2api/static/index.html && \
+    test -f /build/src/qoder2api/static/console.html && \
+    test -f /build/src/qoder2api/static/docs.html && \
+    test -d /build/src/qoder2api/static/assets && \
+    echo "[web-build] static assets ok"
+
+# ============================ stage 2: runtime =============================
+FROM python:3.11-slim-bookworm AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/app/src \
+    QODER_HOST=0.0.0.0 \
+    QODER_PORT=5050 \
+    QODER_DATA_DIR=/data \
+    QODER_CHROMIUM_PATH=/usr/bin/chromium \
+    QODER_ENABLE_VNC=0 \
+    DISPLAY=:99
+
+WORKDIR /app
+
+# ---------------------------------------------------------------------------
+# 系统依赖
+#   chromium          —— 注册机的浏览器（Debian 官方包，amd64/arm64 均有）
+#   xvfb              —— 虚拟 X 显示，Chromium 需要
+#   openbox           —— 轻量窗口管理器，无 WM 时 Chromium 窗口无法正常交互
+#   x11vnc + novnc    —— 可选后备：仅当 QODER_ENABLE_VNC=1 时启动。
+#                        默认改用控制台的远程浏览器（CDP 通道），无需 VNC。
+#   websockify        —— noVNC 的 WebSocket 桥（同上，可选）
+#   fonts-noto-cjk    —— 中文页面渲染
+#   xdotool           —— 调试用窗口操作
+# ---------------------------------------------------------------------------
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        chromium \
+        xvfb \
+        x11vnc \
+        novnc \
+        websockify \
+        openbox \
+        xdotool \
+        fonts-noto-cjk \
+        fonts-liberation \
+        curl \
+        tini \
+        procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# 先装依赖（利用层缓存），再放入前端产物
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+RUN pip install --no-cache-dir ".[registrar]"
+COPY --from=web-build /build/src/qoder2api/static/ ./src/qoder2api/static/
+
+# 注意：PYTHONPATH=/app/src 使 /app/src/qoder2api 优先于 site-packages，
+# 从而 BASE_DIR 指向 /app/src/qoder2api，静态资源与包同目录，无需额外软链。
+
+# 注册机与入口脚本
+COPY docker/ /app/docker/
+RUN chmod +x /app/docker/entrypoint.sh
+
+# 构建期冒烟测试（缺一即构建失败，确保镜像自包含、运行期无需联网安装）：
+#   1) import app 会立即 mount StaticFiles，静态资源缺失即构建失败
+#   2) 注册机所需的全部运行时组件已预装：Chromium / Xvfb / 窗口管理器 /
+#      VNC / noVNC / websockify / 中文字体 / DrissionPage
+#   3) Chromium 真实拉起一次（--version），排除装上了却跑不起来的情况
+# 数据库目录用临时路径，避免与后面 /data 的属主设置产生顺序耦合。
+RUN QODER_DATA_DIR=/tmp/smoke-data python -c "\
+import pathlib, qoder2api.app as a; \
+base = pathlib.Path(a.BASE_DIR); \
+print('[smoke] BASE_DIR =', base); \
+assert (base / 'static' / 'index.html').exists(), 'index.html missing'; \
+assert (base / 'static' / 'console.html').exists(), 'console.html missing'; \
+assert (base / 'static' / 'docs.html').exists(), 'docs.html missing'; \
+assert (base / 'static' / 'assets').is_dir(), 'assets/ missing'; \
+import DrissionPage; \
+print('[smoke] DrissionPage ok'); \
+print('[smoke] static assets resolvable')" \
+    && for bin in Xvfb openbox x11vnc websockify curl tini; do \
+           command -v "$bin" >/dev/null 2>&1 || { echo "[smoke] MISSING binary: $bin"; exit 1; }; \
+       done \
+    && test -f /usr/share/novnc/vnc.html \
+    && find /usr/share/fonts -iname '*CJK*' -print -quit | grep -q . \
+    && test -x "${QODER_CHROMIUM_PATH}" \
+    && "${QODER_CHROMIUM_PATH}" --version \
+    && echo "[smoke] all runtime components preinstalled"
+
+# 非 root 运行。Chromium 的 --no-sandbox 已由 DEFAULT_CHROMIUM_ARGS 提供，
+# 因此无需 root 也能启动。
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin qoder && \
+    mkdir -p /data /tmp/.X11-unix && \
+    chown -R qoder:qoder /data /app /tmp/.X11-unix && \
+    chmod 1777 /tmp/.X11-unix
+USER qoder
+
+VOLUME ["/data"]
+# 5050 网关；6080 noVNC（观察注册机桌面）
+EXPOSE 5050 6080
+
+# /console 无开关，最稳定
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${QODER_PORT}/console" >/dev/null || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/docker/entrypoint.sh"]
