@@ -15,7 +15,7 @@
 先克隆仓库并安装依赖：
 
 ```bash
-git clone https://github.com/bzym2/QoderGateway.git
+git clone https://github.com/WU-HINS/QoderGateway.git
 cd QoderGateway
 uv sync
 ```

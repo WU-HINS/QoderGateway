@@ -15,7 +15,7 @@ Follow these steps:
 Clone the repository and install dependencies:
 
 ```bash
-git clone https://github.com/bzym2/QoderGateway.git
+git clone https://github.com/WU-HINS/QoderGateway.git
 cd QoderGateway
 uv sync
 ```
