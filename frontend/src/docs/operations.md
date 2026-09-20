@@ -85,6 +85,25 @@ Implementation: it reuses DrissionPage's existing CDP debug channel, streaming `
 
 > **Security**: the remote browser hands full control of that browser to the console user. Change the default password and never expose the console publicly.
 
+## Data Volume Ownership
+
+The image declares `VOLUME /data`. Docker creates a new volume owned by `root`,
+which overrides the build-time `chown` and leaves a non-root user unable to write
+the database (`sqlite3.OperationalError: unable to open database file`).
+
+The container therefore **starts as root**, and the entrypoint first assigns
+`$QODER_DATA_DIR` to the runtime user (uid/gid 10001 by default) before dropping
+privileges via `setpriv` and re-executing itself. Xvfb, the window manager and the
+gateway all run as non-root afterwards. Named volumes need no extra steps.
+
+With a bind mount (`-v /host/path:/data`) the host directory keeps its owner; set it first:
+
+```bash
+sudo chown -R 10001:10001 /host/path
+```
+
+Override the runtime identity with `QODER_UID` / `QODER_GID`.
+
 ## Backup
 
 Stop the server and copy the database file:

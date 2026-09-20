@@ -86,6 +86,24 @@ docker run -d --name qodergate \
 
 > **安全提示**：远程浏览器等同于把浏览器完全控制权交给控制台使用者，请务必修改默认密码，勿将控制台暴露公网。
 
+## 数据卷属主
+
+镜像声明了 `VOLUME /data`。Docker 创建新卷时属主是 `root`，会覆盖构建期的
+`chown` 结果，导致非 root 用户无法写数据库（`sqlite3.OperationalError: unable to
+open database file`）。
+
+因此容器**以 root 启动入口脚本**，由它先把 `$QODER_DATA_DIR` 归属到运行用户
+（默认 uid/gid 10001），再用 `setpriv` 降权重新执行；之后 Xvfb、窗口管理器、
+网关全部以非 root 运行。挂载命名卷无需任何额外操作。
+
+绑定挂载（`-v /host/path:/data`）时宿主机目录属主不会被自动修正，请先执行：
+
+```bash
+sudo chown -R 10001:10001 /host/path
+```
+
+运行身份可用 `QODER_UID` / `QODER_GID` 覆盖。
+
 ## 备份
 
 停止服务后复制数据库文件：

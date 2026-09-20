@@ -144,7 +144,9 @@ docker compose up -d
 | DrissionPage（`[registrar]` extra） | 浏览器自动化 |
 | 前端产物（Landing / Console / Docs） | 构建阶段编译进镜像 |
 
-- 数据持久化在 `/data`（SQLite），以非 root 用户（uid 10001）运行
+- 数据持久化在 `/data`（SQLite）。容器以 root 启动入口脚本，先修正数据卷属主，
+  再降权到非 root（uid 10001）运行全部进程——因此**挂载全新命名卷也能直接写入**，
+  不需要事先 `chown`
 - 容器内已设置 `QODER_HOST=0.0.0.0`，直接映射端口即可访问
 - 构建期会逐项校验上述组件；任一缺失则**构建失败**，不会把问题带到运行期
 

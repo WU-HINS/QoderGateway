@@ -76,7 +76,8 @@ COPY --from=web-build /build/src/qoder2api/static/ ./src/qoder2api/static/
 
 # 注册机与入口脚本
 COPY docker/ /app/docker/
-RUN chmod +x /app/docker/entrypoint.sh
+# 显式 755：降权后需要「读取」该脚本重新执行，仅 +x 在极端权限下可能不可读
+RUN chmod 755 /app/docker/entrypoint.sh
 
 # 构建期冒烟测试（缺一即构建失败，确保镜像自包含、运行期无需联网安装）：
 #   1) import app 会立即 mount StaticFiles，静态资源缺失即构建失败
@@ -103,13 +104,14 @@ print('[smoke] static assets resolvable')" \
     && "${QODER_CHROMIUM_PATH}" --version \
     && echo "[smoke] all runtime components preinstalled"
 
-# 非 root 运行。Chromium 的 --no-sandbox 已由 DEFAULT_CHROMIUM_ARGS 提供，
-# 因此无需 root 也能启动。
+# 运行身份。注意：容器以 root 启动 entrypoint —— 因为下面声明了 VOLUME /data，
+# Docker 挂载新卷时属主是 root，会覆盖这里 chown 的结果，导致非 root 用户
+# 无法写数据库。entrypoint 会先修正属主，再降权到 qoder 运行全部进程。
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin qoder && \
-    mkdir -p /data /tmp/.X11-unix && \
-    chown -R qoder:qoder /data /app /tmp/.X11-unix && \
-    chmod 1777 /tmp/.X11-unix
-USER qoder
+    mkdir -p /data && \
+    chown -R qoder:qoder /data /app && \
+    mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+# /tmp/.X11-unix 必须保持 root 属主（Xvfb 会检查），仅放开写权限
 
 VOLUME ["/data"]
 # 5050 网关（人机验证通过控制台内嵌的远程浏览器完成）
@@ -119,4 +121,5 @@ EXPOSE 5050
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${QODER_PORT}/console" >/dev/null || exit 1
 
+# 以 root 启动：entrypoint 需先修正数据卷属主，再降权到 qoder 运行
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/docker/entrypoint.sh"]
