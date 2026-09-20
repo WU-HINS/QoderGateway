@@ -3,10 +3,19 @@ from pathlib import Path
 
 
 def load_dotenv() -> None:
-    env_path = Path.cwd() / ".env"
-    if not env_path.exists():
+    """加载当前工作目录的 .env。
+
+    必须容错：.env 是可选配置，目录不可访问或文件不可读时只应跳过，
+    不能让整个服务因为一个可选的配置文件而起不来。
+    """
+    try:
+        env_path = Path.cwd() / ".env"
+        if not env_path.exists():
+            return
+        content = env_path.read_text(encoding="utf-8")
+    except OSError:
         return
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+    for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -63,7 +72,11 @@ def dotenv_value(key: str) -> str | None:
     value = (os.getenv(key) or "").strip()
     if value:
         return value
-    for env_path in (Path.cwd() / ".env", _PROJECT_ENV):
+    try:
+        candidates = (Path.cwd() / ".env", _PROJECT_ENV)
+    except OSError:
+        candidates = (_PROJECT_ENV,)
+    for env_path in candidates:
         try:
             if not env_path.exists():
                 continue
