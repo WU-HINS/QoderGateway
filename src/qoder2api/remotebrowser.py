@@ -264,32 +264,66 @@ def _find_bot_page(task_id: str) -> Any:
     return page
 
 
+def _safe_page_address(page: Any) -> str:
+    """安全读取浏览器调试地址。"""
+    try:
+        return str(page.address)
+    except Exception:
+        return ""
+
+
+def _safe_page_url(page: Any) -> str:
+    """安全读取页面 URL。
+
+    不能用 getattr(page, "url", "")：默认值只在属性「不存在」时生效，
+    而页面已断开时访问 url 会抛 PageDisconnectedError，getattr 兜不住。
+    """
+    try:
+        return str(page.url or "")
+    except Exception:
+        return ""
+
+
 def list_browsers() -> list[dict[str, Any]]:
-    """列出当前有浏览器可投屏的任务。"""
+    """列出当前有浏览器可投屏的任务。
+
+    两点注意：
+      - 先在锁内取快照，随后释放锁再做 CDP 调用。读取 page.url 会发起
+        CDP 请求，若在持有 registrar._LOCK 时进行，会阻塞注册机的日志与
+        状态更新。
+      - 单个任务出错不能影响整体：任务结束后浏览器会被关闭，
+        此时读取其属性会抛 PageDisconnectedError。
+    """
     from . import registrar
 
-    items: list[dict[str, Any]] = []
     with registrar._LOCK:
-        groups = (("active", registrar._REGISTRAR["active"]),
-                  ("recent", registrar._REGISTRAR["recent"]))
-        for group, tasks in groups:
-            for tid, task in tasks.items():
-                bot = task.get("bot")
-                page = getattr(bot, "page", None) if bot is not None else None
-                if page is None:
-                    continue
-                try:
-                    address = str(page.address)
-                except Exception:
-                    address = ""
+        snapshots = [
+            (group, dict(tasks))
+            for group, tasks in (
+                ("active", registrar._REGISTRAR["active"]),
+                ("recent", registrar._REGISTRAR["recent"]),
+            )
+        ]
+
+    items: list[dict[str, Any]] = []
+    for group, tasks in snapshots:
+        for tid, task in tasks.items():
+            bot = task.get("bot")
+            page = getattr(bot, "page", None) if bot is not None else None
+            if page is None:
+                continue
+            try:
                 items.append({
                     "task_id": tid,
                     "group": group,
                     "stage": task.get("stage"),
-                    "address": address,
-                    "url": getattr(page, "url", ""),
+                    "address": _safe_page_address(page),
+                    "url": _safe_page_url(page),
                     "enabled": remote_browser_enabled(),
                 })
+            except Exception:
+                # 浏览器已关闭或状态异常：跳过该条目，不影响其他任务
+                continue
     return items
 
 

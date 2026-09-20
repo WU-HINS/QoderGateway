@@ -116,10 +116,26 @@ def _bind_bot(task_id: str, bot: Any) -> None:
             task["bot"] = bot
 
 
+def _unbind_bot(task_id: str) -> None:
+    """解除浏览器绑定。
+
+    浏览器一旦关闭就必须调用：否则任务状态里会残留一个已断开的
+    ChromiumPage，控制台轮询列表读取其属性会抛 PageDisconnectedError，
+    进而把 /ui/remote-browser 打成 500。
+    """
+    with _LOCK:
+        for bucket in (_REGISTRAR["active"], _REGISTRAR["recent"]):
+            task = bucket.get(task_id)
+            if task is not None:
+                task.pop("bot", None)
+
+
 def _finish_task(task_id: str, stage: str, result: dict | None = None, error: str | None = None) -> None:
     """子任务完成：归档到 recent 并计入统计。"""
     with _LOCK:
         task = _REGISTRAR["active"].pop(task_id, None)
+        if task is not None:
+            task.pop("bot", None)  # 任务终止，浏览器已/即将关闭
         if task is None:
             task = {"stage": stage, "logs": [], "result": None, "error": None, "started_at": 0}
         task["stage"] = stage
@@ -810,6 +826,7 @@ def _run_one(task_id: str) -> None:
         _bind_bot(task_id, reg)  # 供控制台远程查看/操作浏览器
         acct = reg.register()
         reg.close()
+        _unbind_bot(task_id)  # 浏览器已关闭，先解绑避免控制台读到断开页面
         profile = reg.profile_dir
         _log(task_id, "[registrar] register done")
 
@@ -820,6 +837,7 @@ def _run_one(task_id: str) -> None:
             cred = dev.device()
         finally:
             dev.close()
+            _unbind_bot(task_id)
 
         _set_task(task_id, "saving")
         _save_account(task_id, acct, cred)
@@ -841,6 +859,7 @@ def _run_one(task_id: str) -> None:
                 reg.close()
             except Exception:
                 pass
+        _unbind_bot(task_id)  # 兜底：确保退出时不留已断开的浏览器引用
 
 
 def _save_account(task_id: str, acct: dict, cred: dict) -> str:
