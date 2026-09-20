@@ -159,6 +159,232 @@ const TOAST_STYLES: Record<ToastType, { bg: string; border: string; icon: string
 
 const ToastCtx = createContext<{ push: (t: ToastType, title: string, message: string) => void }>({ push: () => {} })
 
+
+// ───────────────────────────────────────────────────────────────────────────
+// 远程浏览器面板：在控制台里直接查看并操作注册机的 Chromium（无需 VNC）
+//
+// 画面经 WebSocket 下发 JPEG 帧，鼠标/键盘事件原样回放到浏览器 CDP，
+// 因此可以直接在画面上拖动滑块完成人机验证。
+// ───────────────────────────────────────────────────────────────────────────
+interface RemoteBrowser {
+  task_id: string
+  group: string
+  stage: string | null
+  url: string
+  enabled: boolean
+}
+
+function RemoteBrowserPanel({ token, lang }: { token: string | null; lang: 'en' | 'zh' }) {
+  const zh = lang === 'zh'
+  const [browsers, setBrowsers] = useState<RemoteBrowser[]>([])
+  const [selected, setSelected] = useState<string>('')
+  const [status, setStatus] = useState<'idle' | 'connecting' | 'live' | 'error'>('idle')
+  const [message, setMessage] = useState('')
+  const [enabled, setEnabled] = useState(true)
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
+  const sizeRef = useRef({ w: 0, h: 0 })
+  // 页面 CSS viewport 尺寸：坐标换算以它为准，避免 devicePixelRatio 造成偏移
+  const viewportRef = useRef({ w: 0, h: 0 })
+
+  const L = {
+    title: zh ? '远程浏览器（在此完成人机验证）' : 'Remote Browser (solve CAPTCHA here)',
+    hint: zh
+      ? '画面来自注册机正在使用的 Chromium，直接在此拖动滑块即可完成验证，无需打开 VNC。'
+      : 'This is the Chromium actually used by the registrar. Drag the slider right here — no VNC needed.',
+    none: zh ? '当前没有运行中的浏览器。启动注册机后这里会出现。' : 'No browser running. Start the registrar to see it here.',
+    disabled: zh ? '远程浏览器已在服务端关闭（QODER_REMOTE_BROWSER=0）。' : 'Remote browser is disabled server-side (QODER_REMOTE_BROWSER=0).',
+    connect: zh ? '连接' : 'Connect',
+    disconnect: zh ? '断开' : 'Disconnect',
+    connecting: zh ? '连接中…' : 'Connecting…',
+    live: zh ? '已连接' : 'Live',
+    pick: zh ? '选择任务' : 'Select task',
+  }
+
+  const fetchBrowsers = useCallback(async () => {
+    if (!token) return
+    try {
+      const resp = await fetch('/ui/remote-browser', { headers: { 'X-Gateway-Token': token } })
+      if (!resp.ok) return
+      const data = await resp.json()
+      setEnabled(!!data.enabled)
+      setBrowsers(data.browsers || [])
+    } catch { /* ignore */ }
+  }, [token])
+
+  useEffect(() => {
+    fetchBrowsers()
+    const timer = setInterval(fetchBrowsers, 4000)
+    return () => clearInterval(timer)
+  }, [fetchBrowsers])
+
+  // 默认选中第一个可用任务
+  useEffect(() => {
+    if (!selected && browsers.length) setSelected(browsers[0].task_id)
+  }, [browsers, selected])
+
+  const disconnect = useCallback(() => {
+    if (wsRef.current) {
+      try { wsRef.current.close() } catch { /* ignore */ }
+      wsRef.current = null
+    }
+    setStatus('idle')
+  }, [])
+
+  const connect = useCallback(() => {
+    if (!token || !selected) return
+    disconnect()
+    setStatus('connecting')
+    setMessage('')
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+    const ws = new WebSocket(proto + '://' + location.host + '/ui/remote-browser/' + selected + '/ws?token=' + encodeURIComponent(token))
+    wsRef.current = ws
+
+    ws.onmessage = (ev) => {
+      let msg: { type?: string; data?: string; message?: string; viewport?: { width?: number; height?: number } }
+      try { msg = JSON.parse(ev.data) } catch { return }
+      if (msg.type === 'ready') {
+        const vp = (msg as { viewport?: { width?: number; height?: number } }).viewport
+        if (vp && vp.width && vp.height) viewportRef.current = { w: vp.width, h: vp.height }
+        setStatus('live')
+        return
+      }
+      if (msg.type === 'error') { setStatus('error'); setMessage(msg.message || 'error'); return }
+      if (msg.type === 'frame' && msg.data && canvasRef.current) {
+        const img = new Image()
+        img.onload = () => {
+          const canvas = canvasRef.current
+          if (!canvas) return
+          if (sizeRef.current.w !== img.width || sizeRef.current.h !== img.height) {
+            canvas.width = img.width
+            canvas.height = img.height
+            sizeRef.current = { w: img.width, h: img.height }
+          }
+          const ctx = canvas.getContext('2d')
+          if (ctx) ctx.drawImage(img, 0, 0)
+        }
+        img.src = 'data:image/jpeg;base64,' + msg.data
+      }
+    }
+    ws.onerror = () => { setStatus('error'); setMessage(zh ? '连接失败' : 'Connection failed') }
+    ws.onclose = () => { setStatus(prev => (prev === 'error' ? 'error' : 'idle')) }
+  }, [token, selected, disconnect, zh])
+
+  useEffect(() => () => disconnect(), [disconnect])
+
+  // 把画布上的点击位置换算为页面 CSS 像素坐标。
+  // 以 viewport 尺寸为基准（而非画布位图尺寸），这样即使 Chromium 因
+  // devicePixelRatio 放大截图，坐标依然精确对应页面元素。
+  const toPageCoords = (ev: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current
+    if (!canvas) return { x: 0, y: 0 }
+    const rect = canvas.getBoundingClientRect()
+    if (rect.width === 0 || rect.height === 0) return { x: 0, y: 0 }
+    const target = viewportRef.current.w > 0
+      ? viewportRef.current
+      : { w: canvas.width, h: canvas.height }
+    const x = ((ev.clientX - rect.left) / rect.width) * target.w
+    const y = ((ev.clientY - rect.top) / rect.height) * target.h
+    return { x: Math.round(x), y: Math.round(y) }
+  }
+
+  const send = (payload: Record<string, unknown>) => {
+    const ws = wsRef.current
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload))
+  }
+
+  const onMouse = (event: string, ev: React.MouseEvent<HTMLCanvasElement>, clickCount = 0) => {
+    const { x, y } = toPageCoords(ev)
+    const button = ev.button === 2 ? 'right' : ev.button === 1 ? 'middle' : 'left'
+    send({ type: 'mouse', event, x, y, button, clickCount })
+  }
+
+  const onWheel = (ev: React.WheelEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const rect = canvas.getBoundingClientRect()
+    if (rect.width === 0 || rect.height === 0) return
+    const target = viewportRef.current.w > 0
+      ? viewportRef.current
+      : { w: canvas.width, h: canvas.height }
+    const x = Math.round(((ev.clientX - rect.left) / rect.width) * target.w)
+    const y = Math.round(((ev.clientY - rect.top) / rect.height) * target.h)
+    send({ type: 'wheel', x, y, deltaX: ev.deltaX, deltaY: ev.deltaY })
+  }
+
+  const onKey = (event: 'keyDown' | 'keyUp' | 'char', ev: React.KeyboardEvent<HTMLCanvasElement>) => {
+    send({
+      type: 'key', event, key: ev.key, code: ev.code,
+      keyCode: ev.keyCode, text: event === 'char' ? ev.key : '',
+      modifiers: (ev.altKey ? 1 : 0) | (ev.ctrlKey ? 2 : 0) | (ev.metaKey ? 4 : 0) | (ev.shiftKey ? 8 : 0),
+    })
+  }
+
+  return (
+    <div className="bg-white/70 backdrop-blur-xl border border-hairline rounded-2xl overflow-hidden">
+      <div className="px-6 py-4 border-b border-hairline flex items-center justify-between flex-wrap gap-3">
+        <div className="flex items-center gap-2">
+          <span className="material-symbols-outlined text-base text-ink">cast</span>
+          <span className="text-sm font-semibold text-ink">{L.title}</span>
+          {status === 'live' && (
+            <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-emerald-100 text-emerald-700">{L.live}</span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <select
+            value={selected}
+            onChange={(e) => { disconnect(); setSelected(e.target.value) }}
+            className="h-9 px-3 rounded-lg border border-hairline bg-white text-xs text-ink"
+          >
+            {browsers.length === 0 && <option value="">{L.pick}</option>}
+            {browsers.map(b => (
+              <option key={b.task_id} value={b.task_id}>{b.task_id} · {b.stage || '-'}</option>
+            ))}
+          </select>
+          {status === 'live' || status === 'connecting' ? (
+            <button onClick={disconnect} className="h-9 px-4 rounded-lg bg-red-600 text-white text-xs font-bold hover:bg-red-700">
+              {L.disconnect}
+            </button>
+          ) : (
+            <button
+              onClick={connect}
+              disabled={!selected || !enabled}
+              className={'h-9 px-4 rounded-lg text-xs font-bold ' + (!selected || !enabled ? 'bg-neutral-300 text-neutral-500 cursor-not-allowed' : 'bg-ink text-white hover:bg-neutral-800')}
+            >
+              {L.connect}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {!enabled ? (
+        <div className="p-6 text-sm text-amber-800 bg-amber-50">{L.disabled}</div>
+      ) : browsers.length === 0 ? (
+        <div className="p-6 text-sm text-body">{L.none}</div>
+      ) : (
+        <>
+          <div className="px-6 pt-4 text-xs text-body">{L.hint}</div>
+          <div className="p-6">
+            <canvas
+              ref={canvasRef}
+              tabIndex={0}
+              className="max-w-full max-h-[70vh] bg-neutral-900 rounded-xl border border-hairline cursor-crosshair outline-none"
+              onMouseMove={(e) => onMouse('mouseMoved', e)}
+              onMouseDown={(e) => onMouse('mousePressed', e, 1)}
+              onMouseUp={(e) => onMouse('mouseReleased', e, 1)}
+              onWheel={onWheel}
+              onKeyDown={(e) => { e.preventDefault(); onKey('keyDown', e); if (e.key.length === 1) onKey('char', e) }}
+              onKeyUp={(e) => { e.preventDefault(); onKey('keyUp', e) }}
+            />
+            {status === 'connecting' && <div className="mt-3 text-xs text-body">{L.connecting}</div>}
+            {status === 'error' && <div className="mt-3 text-xs text-red-600">{message}</div>}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 // ─── Custom UI Components ───
 
 function CustomCheckbox({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: string }) {
@@ -1317,6 +1543,9 @@ export default function App() {
                   <span>{t.register.verifyHint}（{t.register.task} {regStatus.verification}）</span>
                 </div>
               )}
+
+              {/* 远程浏览器：直接在控制台完成人机验证，无需 VNC */}
+              <RemoteBrowserPanel token={token} lang={lang} />
 
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                 <div className="p-6 bg-white/60 backdrop-blur-md border border-hairline rounded-2xl">

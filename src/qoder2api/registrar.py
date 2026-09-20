@@ -14,9 +14,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import os
 import random
-import re
 import shutil
 import string
 import sys
@@ -24,23 +22,40 @@ import tempfile
 import threading
 import time
 import uuid
-from pathlib import Path
 from typing import Any
 
 import httpx
 
+from . import mailbox
 from .accounts import db_get_settings, db_set_settings
 from .database import get_db
-from .env import httpx_client_kwargs, load_dotenv
+from .env import (
+    chromium_extra_args,
+    chromium_headless,
+    chromium_path,
+    httpx_client_kwargs,
+    proxy_url,
+)
 
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
-YYDS_API = "https://maliapi.215.im/v1"
 REGISTER_URL = "https://qoder.com/users/sign-up"
 SUCCESS_URL_MARK = "/download"
 DEVICE_CLIENT_ID = "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb"
 DEVICE_VERIFIER_CHARS = string.ascii_letters + string.digits + "-._~"
+
+# 容器内运行 Chromium 的必需参数：
+#   no-sandbox          —— 容器通常无 CAP_SYS_ADMIN / 无 user namespace
+#   disable-dev-shm-usage —— /dev/shm 默认 64MB，容易导致渲染进程崩溃
+#   disable-gpu         —— 无显卡环境避免 GPU 初始化失败
+DEFAULT_CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--no-first-run",
+    "--no-default-browser-check",
+]
 
 # 服务状态（单例，多任务）
 _REGISTRAR: dict[str, Any] = {
@@ -76,6 +91,17 @@ def _set_task(task_id: str, stage: str, result: dict | None = None, error: str |
             t["result"] = result
         if error is not None:
             t["error"] = error
+
+
+def _bind_bot(task_id: str, bot: Any) -> None:
+    """把任务当前的浏览器实例挂到状态上，供远程画面桥（remotebrowser）取用。
+
+    注意：bot 持有 ChromiumPage，不可序列化，_dump() 已显式排除该字段。
+    """
+    with _LOCK:
+        task = _REGISTRAR["active"].get(task_id) or _REGISTRAR["recent"].get(task_id)
+        if task is not None:
+            task["bot"] = bot
 
 
 def _finish_task(task_id: str, stage: str, result: dict | None = None, error: str | None = None) -> None:
@@ -133,89 +159,29 @@ _VQ = VerifierQueue()
 
 
 # ---------------------------------------------------------------------------
-# YYDS Mail 集成
+# 临时邮箱（provider 抽象层，见 mailbox.py）
+#
+# cloudflare: CF_TEMP_EMAIL_BASE / CF_TEMP_EMAIL_ADMIN_PASSWORD / ...
+# yyds      : YYDS_API_KEY
+# 选择逻辑  : QODER_MAIL_PROVIDER=auto|cloudflare|yyds
 # ---------------------------------------------------------------------------
-def _yyds_key() -> str | None:
-    """动态读取 YYDS_API_KEY：先 reload .env（cwd），再兜底读项目根 .env。
-    不模块级固化，避免服务启动后改配置不生效。"""
-    load_dotenv()
-    key = (os.getenv("YYDS_API_KEY") or "").strip()
-    if key:
-        return key
-    try:
-        env_path = Path(__file__).resolve().parent.parent.parent / ".env"  # 项目根
-        if env_path.exists():
-            for raw in env_path.read_text(encoding="utf-8").splitlines():
-                line = raw.strip()
-                if line.startswith("YYDS_API_KEY="):
-                    key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    if key:
-                        os.environ.setdefault("YYDS_API_KEY", key)
-                        return key
-    except Exception:
-        pass
-    return None
-
-
 def yyds_create_mailbox(prefix: str = "qoder", task_id: str | None = None) -> str:
-    key = _yyds_key()
-    if not key:
-        raise RuntimeError(
-            "YYDS_API_KEY 未配置：请在项目根 .env 或系统环境变量中设置 YYDS_API_KEY（AC- 开头），然后重启服务"
-        )
-    local = prefix + uuid.uuid4().hex[:8]
-    r = httpx.post(
-        f"{YYDS_API}/accounts",
-        headers={"X-API-Key": key, "Content-Type": "application/json"},
-        json={"localPart": local},
-        timeout=20,
-    )
-    r.raise_for_status()
-    address = r.json()["data"]["address"]
-    _log(task_id, f"[mail] created {address}")
-    return address
-
-
-re_digit = re.compile(r"(?<!\d)(\d{6})(?!\d)")
-
-
-def _extract_code(msg: dict) -> str | None:
-    server = msg.get("verificationCode")
-    if server:
-        return str(server)
-    text = msg.get("text") or ""
-    codes = re_digit.findall(text)
-    return codes[0] if codes else None
+    """创建临时邮箱并返回地址（向后兼容的旧函数名）。"""
+    return mailbox.create_mailbox(
+        prefix=prefix,
+        task_id=task_id,
+        log=lambda msg: _log(task_id, msg),
+    ).address
 
 
 def yyds_wait_code(address: str, task_id: str | None = None, timeout: float = 120.0) -> str:
-    key = _yyds_key()
-    if not key:
-        raise RuntimeError("YYDS_API_KEY 未配置：请在项目根 .env 或系统环境变量中设置 YYDS_API_KEY")
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            r = httpx.get(
-                f"{YYDS_API}/messages/next",
-                params={"address": address, "wait": 30},
-                headers={"X-API-Key": key},
-                timeout=45,
-            )
-            if r.status_code == 200:
-                msg = r.json()["data"]["message"]
-                code = _extract_code(msg)
-                if code:
-                    _log(task_id, f"[mail] verification code = {code}")
-                    return code
-                _log(task_id, "[mail] got message but no code, keep polling...")
-            elif r.status_code == 204:
-                _log(task_id, "[mail] no message yet...")
-            else:
-                _log(task_id, f"[mail] unexpected status {r.status_code}")
-        except httpx.HTTPError as e:
-            _log(task_id, f"[mail] poll error: {e}")
-        time.sleep(1)
-    raise TimeoutError(f"no verification code within {timeout}s for {address}")
+    """轮询等待邮箱验证码（向后兼容的旧函数名）。"""
+    return mailbox.wait_verification_code(
+        address,
+        task_id=task_id,
+        timeout=timeout,
+        log=lambda msg: _log(task_id, msg),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +276,23 @@ class RegistrarBot:
         self.proxy = proxy
         co = ChromiumOptions()
         co.set_local_port(_free_port())  # 独立调试端口，杜绝实例串扰
+
+        # Chromium 路径：容器/自定义安装必须显式指定（DrissionPage 默认只找 Windows 路径）
+        browser_path = chromium_path()
+        if browser_path:
+            co.set_browser_path(browser_path)
+            _log(task_id, f"[browser] executable = {browser_path}")
+
+        if chromium_headless():
+            co.headless(True)
+            _log(task_id, "[browser] headless mode (人机验证可能无法完成)")
+
+        # 容器/root 环境必需：无沙箱、共享内存、禁用 /dev/shm 限制与 GPU
+        for arg in DEFAULT_CHROMIUM_ARGS:
+            co.set_argument(arg)
+        for arg in chromium_extra_args():
+            co.set_argument(arg)
+
         if proxy:
             co.set_proxy(proxy)
             _log(task_id, f"[browser] using proxy {proxy[:48]}...")
@@ -323,6 +306,10 @@ class RegistrarBot:
         self.page = ChromiumPage(co)
 
     # ---- 窗口控制（平时隐藏后台，人机验证置顶一次） ----
+    #
+    # Windows: 用 win32gui 精确置顶。
+    # Linux  : 通常运行在 Xvfb 虚拟屏上，没有真实窗口管理器，置顶无意义，
+    #          改为把窗口最大化并居中，便于通过 VNC 观察和操作滑块。
     def window_hide(self) -> None:
         try:
             self.page.set.window.hide()
@@ -335,6 +322,21 @@ class RegistrarBot:
             self.page.set.window.show()
         except Exception:
             pass
+        if sys.platform == "win32":
+            self._window_top_windows()
+        else:
+            self._window_focus_linux()
+
+    def _window_focus_linux(self) -> None:
+        """Linux/Xvfb：最大化并居中，方便 VNC 里操作滑块。"""
+        try:
+            self.page.set.window.max()
+            self.page.set.window.normal()
+            _log(self.task_id, "[browser] window maximized (Xvfb/VNC)")
+        except Exception as e:
+            _log(self.task_id, f"[browser] maximize error: {e}")
+
+    def _window_top_windows(self) -> None:
         try:
             import win32con
             import win32gui
@@ -701,16 +703,22 @@ def _run_parent(parent_id: str, workers: int = 3) -> None:
 
 def _run_one(task_id: str) -> None:
     reg: RegistrarBot | None = None
+    # 注册机同样遵循 QODER_PROXY：浏览器与 deviceToken poll 都走代理
+    proxy = proxy_url()
+    if proxy:
+        _log(task_id, f"[registrar] using outbound proxy for browser/poll")
     try:
         _set_task(task_id, "registering")
-        reg = RegistrarBot(task_id=task_id, cleanup_profile=False)
+        reg = RegistrarBot(task_id=task_id, cleanup_profile=False, proxy=proxy)
+        _bind_bot(task_id, reg)  # 供控制台远程查看/操作浏览器
         acct = reg.register()
         reg.close()
         profile = reg.profile_dir
         _log(task_id, "[registrar] register done")
 
         _set_task(task_id, "device_auth")
-        dev = RegistrarBot(task_id=task_id, profile_dir=profile, cleanup_profile=True)
+        dev = RegistrarBot(task_id=task_id, profile_dir=profile, cleanup_profile=True, proxy=proxy)
+        _bind_bot(task_id, dev)  # device 阶段换用新浏览器，重新绑定
         try:
             cred = dev.device()
         finally:

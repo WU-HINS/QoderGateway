@@ -5,9 +5,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import asyncio
+
 import httpx
-from fastapi import FastAPI, HTTPException, Header, Depends
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Header, Depends, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .auth import SessionContext, create_session, load_local_session
@@ -25,6 +27,7 @@ from .accounts import (
     batch_import_accounts,
 )
 from .registrar import get_registrar_status, start_registration, stop_registration
+from . import remotebrowser
 from .tokens import (
     refresh_all_account_tokens,
     refresh_one_account,
@@ -271,6 +274,171 @@ async def delete_account(uid: str, verify: None = Depends(check_gateway_token)) 
 @app.get("/ui/logs")
 async def get_logs(verify: None = Depends(check_gateway_token)) -> list[str]:
     return list(logs_queue)
+
+
+# ---------------------------------------------------------------------------
+# 远程浏览器：在控制台里直接查看/操作注册机的 Chromium（无需 VNC）
+# ---------------------------------------------------------------------------
+@app.get("/ui/remote-browser")
+async def remote_browser_info(verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    """列出可投屏的浏览器任务与当前配置。"""
+    return remotebrowser.bridge_info()
+
+
+@app.get("/ui/remote-browser/{task_id}/screenshot")
+async def remote_browser_screenshot(
+    task_id: str,
+    verify: None = Depends(check_gateway_token),
+) -> Response:
+    """单张截图（轮询模式兜底；WebSocket 不可用时前端会退化到它）。"""
+    if not remotebrowser.remote_browser_enabled():
+        raise HTTPException(status_code=403, detail="远程浏览器已关闭（QODER_REMOTE_BROWSER=0）")
+    try:
+        page = await asyncio.to_thread(remotebrowser._find_bot_page, task_id)
+        data = await asyncio.to_thread(remotebrowser.snapshot, page)
+    except remotebrowser.RemoteBrowserError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return Response(content=data, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@app.websocket("/ui/remote-browser/{task_id}/ws")
+async def remote_browser_ws(websocket: WebSocket, task_id: str) -> None:
+    """画面下行 + 输入上行，共用一条 WebSocket。
+
+    鉴权：浏览器 WebSocket 无法自定义请求头，因此 token 通过查询参数传入，
+    并与控制台登录凭据做同一套校验。
+    """
+    token = websocket.query_params.get("token")
+    expected = load_config().get("gateway_token", "admin")
+    if not token or token != expected:
+        await websocket.close(code=4401)
+        return
+    if not remotebrowser.remote_browser_enabled():
+        await websocket.close(code=4403)
+        return
+
+    await websocket.accept()
+
+    try:
+        page = await asyncio.to_thread(remotebrowser._find_bot_page, task_id)
+        debug_address = await asyncio.to_thread(remotebrowser.get_debug_address, page)
+        target_id = await asyncio.to_thread(remotebrowser._page_target_id, debug_address, None)
+        ws_url = await asyncio.to_thread(remotebrowser._cdp_target, debug_address)
+    except remotebrowser.RemoteBrowserError as exc:
+        await websocket.send_json({"type": "error", "message": str(exc)})
+        await websocket.close()
+        return
+
+    session = remotebrowser.CdpSession(ws_url)
+    try:
+        await session.connect()
+        session_id = await session.attach(target_id)
+    except Exception as exc:
+        await websocket.send_json({"type": "error", "message": f"CDP 连接失败: {exc}"})
+        await session.close()
+        await websocket.close()
+        return
+
+    # 告知前端 CSS viewport 尺寸：前端据此把点击坐标换算为页面坐标。
+    # 不能假定截图尺寸等于 CSS 尺寸——若用户通过 QODER_CHROMIUM_ARGS 设置了
+    # --force-device-scale-factor，截图会按 devicePixelRatio 放大。
+    viewport: dict[str, Any] = {}
+    try:
+        metrics = await session.send("Page.getLayoutMetrics", {}, session_id=session_id)
+        for key in ("cssVisualViewport", "cssLayoutViewport", "visualViewport", "layoutViewport"):
+            candidate = metrics.get(key)
+            if isinstance(candidate, dict) and candidate.get("clientWidth"):
+                viewport = {
+                    "width": candidate.get("clientWidth"),
+                    "height": candidate.get("clientHeight"),
+                }
+                break
+    except Exception:
+        viewport = {}
+
+    await websocket.send_json({"type": "ready", "task_id": task_id, "viewport": viewport})
+    stop = asyncio.Event()
+
+    async def pump_frames() -> None:
+        """按配置帧率持续推送 JPEG 帧。"""
+        quality = remotebrowser.remote_browser_quality()
+        interval = 1.0 / max(1, remotebrowser.remote_browser_fps())
+        while not stop.is_set():
+            try:
+                raw = await session.send("Page.captureScreenshot",
+                                         {"format": "jpeg", "quality": quality},
+                                         session_id=session_id, timeout=15)
+                data = raw.get("data")
+                if data:
+                    await websocket.send_json({"type": "frame", "data": data})
+            except Exception:
+                break
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+
+    async def pump_events() -> None:
+        """接收前端输入事件并转发到浏览器。"""
+        while not stop.is_set():
+            try:
+                message = await websocket.receive_json()
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
+            kind = message.get("type")
+            try:
+                if kind == "mouse":
+                    params = remotebrowser.mouse_event_params(
+                        message.get("event", "mouseMoved"),
+                        message.get("x", 0), message.get("y", 0),
+                        message.get("button", "left"),
+                        int(message.get("clickCount", 0)),
+                        int(message.get("modifiers", 0)),
+                    )
+                    await session.send("Input.dispatchMouseEvent", params, session_id=session_id)
+                elif kind == "wheel":
+                    await session.send("Input.dispatchMouseEvent", {
+                        "type": "mouseWheel",
+                        "x": float(message.get("x", 0)),
+                        "y": float(message.get("y", 0)),
+                        "deltaX": float(message.get("deltaX", 0)),
+                        "deltaY": float(message.get("deltaY", 0)),
+                    }, session_id=session_id)
+                elif kind == "key":
+                    params = remotebrowser.key_event_params(
+                        message.get("event", "keyDown"),
+                        message.get("key", ""),
+                        message.get("text", ""),
+                        message.get("code", ""),
+                        int(message.get("keyCode", 0)),
+                        int(message.get("modifiers", 0)),
+                    )
+                    await session.send("Input.dispatchKeyEvent", params, session_id=session_id)
+                elif kind == "navigate":
+                    await session.send("Page.navigate", {"url": message.get("url", "")},
+                                       session_id=session_id)
+            except Exception:
+                continue
+
+    frame_task = asyncio.create_task(pump_frames())
+    event_task = asyncio.create_task(pump_events())
+    try:
+        done, pending = await asyncio.wait(
+            {frame_task, event_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+    finally:
+        stop.set()
+        frame_task.cancel()
+        event_task.cancel()
+        await session.close()
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 @app.post("/ui/registrar/start")
