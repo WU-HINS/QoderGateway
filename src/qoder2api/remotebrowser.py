@@ -24,6 +24,8 @@ import json
 import threading
 from typing import Any
 
+from urllib.parse import urlparse, urlunparse
+
 import httpx
 
 from .env import (
@@ -35,6 +37,29 @@ from .env import (
 
 class RemoteBrowserError(RuntimeError):
     pass
+
+
+def _pin_ws_host(ws_url: str, debug_address: str) -> str:
+    """把 CDP WebSocket URL 的 host:port 固定为调试端口实际监听的地址。
+
+    Chromium 的 /json/version 常返回 ws://localhost:PORT/devtools/browser/...，
+    但容器里 localhost 可能优先解析到 IPv6 ::1，而 Chromium 只监听 IPv4
+    127.0.0.1 —— WebSocket 握手会一直挂起直到超时
+    （表现为 "timed out during opening handshake"）。
+
+    这里统一改写成我们刚刚确认可达的调试地址，避免依赖容器内的名字解析。
+    """
+    try:
+        target = urlparse(
+            debug_address if "://" in debug_address else f"http://{debug_address}"
+        )
+        parsed = urlparse(ws_url)
+        host = target.hostname or "127.0.0.1"
+        port = target.port or parsed.port
+        netloc = f"{host}:{port}" if port else host
+        return urlunparse(parsed._replace(netloc=netloc))
+    except Exception:
+        return ws_url
 
 
 def _cdp_target(debug_address: str) -> str:
@@ -61,7 +86,8 @@ def _cdp_target(debug_address: str) -> str:
     ws_url = info.get("webSocketDebuggerUrl")
     if not ws_url:
         raise RemoteBrowserError(f"调试端口未返回 webSocketDebuggerUrl: {info}")
-    return ws_url
+    # 固定 host:port，规避 localhost -> IPv6 导致的握手超时
+    return _pin_ws_host(ws_url, address)
 
 
 def _page_target_id(debug_address: str, tab_id: str | None) -> str | None:

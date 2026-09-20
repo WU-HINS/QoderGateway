@@ -354,6 +354,31 @@ async def remote_browser_screenshot(
     return Response(content=data, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
+async def _ws_send(websocket: WebSocket, payload: dict[str, Any]) -> bool:
+    """向 WebSocket 发送 JSON；客户端已断开时返回 False 而不抛异常。
+
+    浏览器在传输期间可能随时离开（刷新页面、关闭标签、切换页签），
+    此时 send 会抛 WebSocketDisconnect；若不处理，会在 ASGI 层刷出
+    一长串堆栈，看起来像服务出错，实际只是客户端走了。
+    """
+    try:
+        await websocket.send_json(payload)
+        return True
+    except Exception:
+        return False
+
+
+async def _ws_close(websocket: WebSocket, code: int | None = None) -> None:
+    """关闭 WebSocket，忽略客户端已断开的情况。"""
+    try:
+        if code is None:
+            await websocket.close()
+        else:
+            await websocket.close(code=code)
+    except Exception:
+        pass
+
+
 @app.websocket("/ui/remote-browser/{task_id}/ws")
 async def remote_browser_ws(websocket: WebSocket, task_id: str) -> None:
     """画面下行 + 输入上行，共用一条 WebSocket。
@@ -364,10 +389,10 @@ async def remote_browser_ws(websocket: WebSocket, task_id: str) -> None:
     token = websocket.query_params.get("token")
     expected = load_config().get("gateway_token", "admin")
     if not token or token != expected:
-        await websocket.close(code=4401)
+        await _ws_close(websocket, 4401)
         return
     if not remotebrowser.remote_browser_enabled():
-        await websocket.close(code=4403)
+        await _ws_close(websocket, 4403)
         return
 
     await websocket.accept()
@@ -378,8 +403,8 @@ async def remote_browser_ws(websocket: WebSocket, task_id: str) -> None:
         target_id = await asyncio.to_thread(remotebrowser._page_target_id, debug_address, None)
         ws_url = await asyncio.to_thread(remotebrowser._cdp_target, debug_address)
     except remotebrowser.RemoteBrowserError as exc:
-        await websocket.send_json({"type": "error", "message": str(exc)})
-        await websocket.close()
+        await _ws_send(websocket, {"type": "error", "message": str(exc)})
+        await _ws_close(websocket)
         return
 
     session = remotebrowser.CdpSession(ws_url)
@@ -387,9 +412,9 @@ async def remote_browser_ws(websocket: WebSocket, task_id: str) -> None:
         await session.connect()
         session_id = await session.attach(target_id)
     except Exception as exc:
-        await websocket.send_json({"type": "error", "message": f"CDP 连接失败: {exc}"})
+        await _ws_send(websocket, {"type": "error", "message": f"CDP 连接失败: {exc}"})
         await session.close()
-        await websocket.close()
+        await _ws_close(websocket)
         return
 
     # 告知前端 CSS viewport 尺寸：前端据此把点击坐标换算为页面坐标。
@@ -409,7 +434,7 @@ async def remote_browser_ws(websocket: WebSocket, task_id: str) -> None:
     except Exception:
         viewport = {}
 
-    await websocket.send_json({"type": "ready", "task_id": task_id, "viewport": viewport})
+    await _ws_send(websocket, {"type": "ready", "task_id": task_id, "viewport": viewport})
     stop = asyncio.Event()
 
     async def pump_frames() -> None:
@@ -423,7 +448,7 @@ async def remote_browser_ws(websocket: WebSocket, task_id: str) -> None:
                                          session_id=session_id, timeout=15)
                 data = raw.get("data")
                 if data:
-                    await websocket.send_json({"type": "frame", "data": data})
+                    await _ws_send(websocket, {"type": "frame", "data": data})
             except Exception:
                 break
             try:
@@ -489,7 +514,7 @@ async def remote_browser_ws(websocket: WebSocket, task_id: str) -> None:
         event_task.cancel()
         await session.close()
         try:
-            await websocket.close()
+            await _ws_close(websocket)
         except Exception:
             pass
 
