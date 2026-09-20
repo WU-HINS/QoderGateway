@@ -774,7 +774,8 @@ export default function App() {
   const [regStatus, setRegStatus] = useState<RegStatus | null>(null)
   const [regStarting, setRegStarting] = useState(false)
   const [regStopping, setRegStopping] = useState(false)
-  const [regCount, setRegCount] = useState(2)
+  // 默认 1：每个子任务都会拉起一个独立 Chromium，机械硬盘上并发过高会打满 IO
+  const [regCount, setRegCount] = useState(1)
 
   const switchLang = (next: Lang) => {
     setLang(next)

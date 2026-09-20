@@ -57,6 +57,15 @@ DEFAULT_CHROMIUM_ARGS = [
     "--no-default-browser-check",
 ]
 
+# DrissionPage 连接浏览器的重试次数与间隔（秒）。
+# 默认值偏短：Chromium 冷启动在机械硬盘或低配环境下可能耗时数十秒，
+# 太短会直接报 BrowserConnectError。10 次 × 3 秒 ≈ 最长等待 30 秒。
+BROWSER_CONNECT_RETRY = (10, 3)
+
+# 单个母线程每批并发的子任务数。每个子任务 = 一个独立 Chromium 实例，
+# 并发越高磁盘压力越大；机械硬盘上建议保持 1~3。
+BROWSER_WORKERS_PER_PARENT = 3
+
 # 服务状态（单例，多任务）
 _REGISTRAR: dict[str, Any] = {
     "running": False,
@@ -303,7 +312,26 @@ class RegistrarBot:
             _log(task_id, f"[browser] new temp profile: {self.profile_dir}")
         self._cleanup_profile = cleanup_profile
         co.set_user_data_path(self.profile_dir)
-        self.page = ChromiumPage(co)
+
+        # 加长连接重试：HDD / 低配环境下 Chromium 冷启动可能很慢
+        if hasattr(co, "set_retry"):
+            try:
+                co.set_retry(*BROWSER_CONNECT_RETRY)
+            except Exception:
+                pass
+
+        try:
+            self.page = ChromiumPage(co)
+        except Exception as exc:
+            # 原始异常信息对容器/HDD 场景缺乏指向性，这里补充排查方向
+            _log(task_id, f"[browser] 启动 Chromium 失败: {type(exc).__name__}")
+            _log(task_id, f"[browser] profile = {self.profile_dir}")
+            _log(task_id, "[browser] 排查方向：")
+            _log(task_id, "  1) 确认 Xvfb 在运行且 DISPLAY 正确（容器入口脚本会自动启动）")
+            _log(task_id, "  2) 机械硬盘：Chromium 冷启动很慢，请把并发降到 1（母线程数）")
+            _log(task_id, "  3) 容器请加 --shm-size=1g，否则渲染进程易崩溃")
+            _log(task_id, "  4) 确认 /usr/bin/chromium 可执行且未被安全策略拦截")
+            raise
 
     # ---- 窗口控制（平时隐藏后台，人机验证置顶一次） ----
     #
@@ -644,8 +672,12 @@ def get_registrar_status() -> dict[str, Any]:
         }
 
 
-def start_registration(parents: int = 2) -> dict[str, Any]:
-    """启动 parents 个母线程；每个母线程无限循环：每批并发 3 个子任务，直到 stop_registration()。"""
+def start_registration(parents: int = 1) -> dict[str, Any]:
+    """启动 parents 个母线程；每个母线程无限循环：每批并发子任务，直到 stop_registration()。
+
+    默认 1 是保守值：每个子任务都会拉起一个独立 Chromium，
+    机械硬盘或低配环境下并发启动多个会导致磁盘 IO 饱和、浏览器连接超时。
+    """
     parents = max(1, min(int(parents), 6))
     with _LOCK:
         if _REGISTRAR["running"]:
@@ -674,7 +706,7 @@ def stop_registration() -> dict[str, Any]:
     return {"ok": True}
 
 
-def _run_parent(parent_id: str, workers: int = 3) -> None:
+def _run_parent(parent_id: str, workers: int = BROWSER_WORKERS_PER_PARENT) -> None:
     """母线程：无限循环启动批次，每批 workers 个子任务并发；stop_requested 时停止。"""
     batch = 0
     try:

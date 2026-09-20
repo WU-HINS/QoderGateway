@@ -498,11 +498,15 @@ async def remote_browser_ws(websocket: WebSocket, task_id: str) -> None:
 async def registrar_start(payload: dict[str, Any] | None = None, verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
     """启动注册机（无限循环：parents 个母线程 × 每批 3 个子任务，直到调用 stop）。
 
-    body 可选：{"parents": 2}  —— 母线程数（1-6），每母线程 3 子任务并发。
+    每个母线程每批并发 3 个子任务，即每批最多 parents×3 个 Chromium 同时启动；
+    机械硬盘 / 低配环境请保持 parents=1。
+
+    body 可选：{"parents": 1}  —— 母线程数（1-6）。
     """
     payload = payload or {}
     try:
-        parents = int(payload.get("parents", 2))
+        # 默认 1：每个子任务都会拉起一个独立 Chromium，并发过高会打满磁盘 IO
+        parents = int(payload.get("parents", 1))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="parents 参数无效")
     return start_registration(parents=parents)
