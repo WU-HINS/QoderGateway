@@ -8,7 +8,14 @@ from .env import load_dotenv
 
 load_dotenv()
 
-DB_PATH = Path.home() / ".qoder" / "qoder2api.db"
+def _resolve_db_path() -> Path:
+    """数据库位置：QODER_DATA_DIR > ~/.qoder（保持向后兼容）。"""
+    data_dir = os.getenv("QODER_DATA_DIR", "").strip()
+    base = Path(data_dir) if data_dir else Path.home() / ".qoder"
+    return base / "qoder2api.db"
+
+
+DB_PATH = _resolve_db_path()
 
 
 def get_db():

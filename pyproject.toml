@@ -6,11 +6,19 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "cryptography>=43.0.0",
-    "drissionpage>=4.1.1.4",
     "fastapi>=0.115.0",
     "httpx>=0.27.0",
-    "pypiwin32>=223",
     "uvicorn[standard]>=0.30.6",
+]
+
+[project.optional-dependencies]
+# 注册机：需要 Chromium 的浏览器自动化能力（Docker 镜像已内置 Chromium）
+registrar = [
+    "drissionpage>=4.1.1.4",
+    "pywin32>=306; sys_platform == 'win32'",
+]
+dev = [
+    "pytest>=8.0.0",
 ]
 
 [project.scripts]
@@ -25,3 +33,8 @@ package = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/qoder2api"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 需要 Chromium/Xvfb 的用例在缺失环境下自动跳过（见 tests/test_remote_browser.py）
+addopts = "-q"

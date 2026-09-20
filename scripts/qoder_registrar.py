@@ -46,8 +46,17 @@ from qoder_button_parser import pick_button  # noqa: E402
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
-YYDS_API = "https://maliapi.215.im/v1"
-YYDS_KEY = os.getenv("YYDS_API_KEY", "AC-62b8a8a286e8e898e8cc1e63")
+YYDS_API = os.getenv("YYDS_API_BASE", "https://maliapi.215.im/v1").rstrip("/")
+
+
+def _yyds_key() -> str:
+    """读取 YYDS_API_KEY；不再内置默认密钥（历史上曾硬编码，已移除）。"""
+    key = (os.getenv("YYDS_API_KEY") or "").strip()
+    if not key:
+        raise RuntimeError(
+            "YYDS_API_KEY 未配置：请设置环境变量或在项目根 .env 中添加 YYDS_API_KEY=AC-..."
+        )
+    return key
 REGISTER_URL = "https://qoder.com/users/sign-up"
 LOGIN_URL = "https://qoder.com/users/sign-in"
 SUCCESS_URL_MARK = "/download"          # 注册成功跳转特征
@@ -98,7 +107,7 @@ def yyds_create_mailbox(prefix: str = "qoder") -> str:
     local = prefix + uuid.uuid4().hex[:8]
     r = httpx.post(
         f"{YYDS_API}/accounts",
-        headers={"X-API-Key": YYDS_KEY, "Content-Type": "application/json"},
+        headers={"X-API-Key": _yyds_key(), "Content-Type": "application/json"},
         json={"localPart": local},
         timeout=20,
     )
@@ -126,7 +135,7 @@ def yyds_wait_code(address: str, timeout: float = 120.0) -> str:
             r = httpx.get(
                 f"{YYDS_API}/messages/next",
                 params={"address": address, "wait": 30},
-                headers={"X-API-Key": YYDS_KEY},
+                headers={"X-API-Key": _yyds_key()},
                 timeout=45,
             )
             if r.status_code == 200:

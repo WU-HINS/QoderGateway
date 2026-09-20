@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 
 from .database import get_db
+from .env import httpx_client_kwargs
 
 OPENAPI = "https://openapi.qoder.sh"
 UA = "qoder/1.1.16"
@@ -49,7 +50,13 @@ def refresh_one_account(uid: str) -> dict[str, Any]:
         token_key = "device_token"
 
     try:
-        r = httpx.post(url, json={"refresh_token": rt}, headers=_headers(), timeout=25)
+        r = httpx.post(
+            url,
+            json={"refresh_token": rt},
+            headers=_headers(),
+            timeout=25,
+            **httpx_client_kwargs(),
+        )
     except httpx.HTTPError as e:
         return {"ok": False, "uid": uid, "error": f"网络错误: {e}"}
 
@@ -104,6 +111,7 @@ def get_account_quota(uid: str) -> dict[str, Any]:
             f"{OPENAPI}/api/v2/quota/usage",
             headers={"Authorization": f"Bearer {tok}", "Accept": "application/json"},
             timeout=20,
+            **httpx_client_kwargs(),
         )
     except httpx.HTTPError as e:
         return {"ok": False, "uid": uid, "error": f"网络错误: {e}"}
@@ -133,9 +141,15 @@ def _refresh_loop() -> None:
     while True:
         time.sleep(REFRESH_INTERVAL)
         try:
-            refresh_all_account_tokens()
-        except Exception:
-            pass
+            result = refresh_all_account_tokens()
+            if result["failed"]:
+                # 刷新失败必须可见：dt- 过期后账号会静默失效
+                print(
+                    f"[tokens] scheduled refresh: ok={result['ok']} "
+                    f"failed={result['failed']} total={result['total']}"
+                )
+        except Exception as exc:
+            print(f"[tokens] scheduled refresh crashed: {type(exc).__name__}: {exc}")
 
 
 def start_refresh_loop() -> None:
