@@ -45,19 +45,21 @@ On Linux add `--add-host=host.docker.internal:host-gateway`.
 
 ## Temp Mail
 
-The registrar needs a mailbox backend for verification codes, selected by `QODER_MAIL_PROVIDER` (`auto` / `cloudflare` / `yyds`).
+The registrar needs a mailbox backend for verification codes. **Configure it in the console**:
+Register tab → "Temp mail configuration". Saving takes effect immediately, no restart needed.
+Settings are stored in the local SQLite database (under `/data`, persisted with the volume).
 
-Self-hosted [cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email) is recommended:
+- Pick the backend from the dropdown: `auto` / `cloudflare` / `yyds`
+- Secret fields (admin password, site password, token) are shown masked and never returned in
+  plaintext; leaving them blank keeps the current value
+- After saving, "Test" creates a real mailbox to confirm the configuration works
+- The `CF_TEMP_EMAIL_*` / `YYDS_API_KEY` environment variables still work as first-deploy
+  defaults; values saved in the console take precedence
 
-```bash
--e QODER_MAIL_PROVIDER=cloudflare \
--e CF_TEMP_EMAIL_BASE=https://mail.example.com \
--e CF_TEMP_EMAIL_ADMIN_PASSWORD=your-admin-password
-```
-
-With `ADMIN_PASSWORDS` configured the gateway uses `/admin/new_address`, bypassing Turnstile and the anonymous-creation restriction.
-
-If the site enables `SITE_PASSWORD`, also set `CF_TEMP_EMAIL_SITE_PASSWORD`.
+Self-hosted [cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)
+is recommended: with `ADMIN_PASSWORDS` set in its `wrangler.toml`, this project uses
+`/admin/new_address`, bypassing Turnstile and the anonymous-creation restriction. If the site
+enables `SITE_PASSWORD`, fill it into "Site password".
 
 ## Running the Registrar in a Container
 
@@ -74,11 +76,10 @@ docker run -d --name qodergate \
 
 Start the registrar from the **Register** tab. A "Remote Browser" panel appears — drag the slider right there. **No VNC, no extra port.**
 
-Implementation: it reuses DrissionPage's existing CDP debug channel, streaming `Page.captureScreenshot` frames over a WebSocket to a frontend canvas and replaying input via `Input.dispatch*`. Xvfb still runs (headed Chromium needs an X display); VNC is off by default.
+Implementation: it reuses DrissionPage's existing CDP debug channel, streaming `Page.captureScreenshot` frames over a WebSocket to a frontend canvas and replaying input via `Input.dispatch*`. Xvfb still runs (headed Chromium needs an X display), but **VNC is neither installed nor exposed**.
 
 - Tune with `QODER_REMOTE_BROWSER_FPS` (default 8) and `QODER_REMOTE_BROWSER_QUALITY` (default 60)
 - Disable via `QODER_REMOTE_BROWSER=0`
-- For classic VNC set `QODER_ENABLE_VNC=1` and publish port `6080`
 - **`--shm-size=1g` is required**: the default 64MB `/dev/shm` crashes Chromium renderers
 - Chromium runs with `--no-sandbox` (containers usually lack `CAP_SYS_ADMIN`)
 

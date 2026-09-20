@@ -2,7 +2,7 @@
 # ---------------------------------------------------------------------------
 # QoderGateway —— 多阶段构建（含注册机所需的 Chromium）
 #   stage 1 (web-build) : Node 构建 React 前端（landing / console / docs）
-#   stage 2 (runtime)   : Python + Chromium + Xvfb + VNC
+#   stage 2 (runtime)   : Python + Chromium + Xvfb
 # 支持 linux/amd64 与 linux/arm64（Debian bookworm 的 chromium 两架构齐备）
 # ---------------------------------------------------------------------------
 
@@ -38,7 +38,6 @@ ENV PYTHONUNBUFFERED=1 \
     QODER_PORT=5050 \
     QODER_DATA_DIR=/data \
     QODER_CHROMIUM_PATH=/usr/bin/chromium \
-    QODER_ENABLE_VNC=0 \
     DISPLAY=:99
 
 WORKDIR /app
@@ -48,21 +47,17 @@ WORKDIR /app
 #   chromium          —— 注册机的浏览器（Debian 官方包，amd64/arm64 均有）
 #   xvfb              —— 虚拟 X 显示，Chromium 需要
 #   openbox           —— 轻量窗口管理器，无 WM 时 Chromium 窗口无法正常交互
-#   x11vnc + novnc    —— 可选后备：仅当 QODER_ENABLE_VNC=1 时启动。
-#                        默认改用控制台的远程浏览器（CDP 通道），无需 VNC。
-#   websockify        —— noVNC 的 WebSocket 桥（同上，可选）
 #   fonts-noto-cjk    —— 中文页面渲染
-#   xdotool           —— 调试用窗口操作
+#
+# 不安装 VNC（x11vnc/noVNC/websockify）：人机验证改由控制台的远程浏览器
+# 完成 —— 复用 DrissionPage 的 CDP 通道把画面推到控制台并回放输入事件，
+# 已验证可穿透滑块所在的跨源 iframe，无需再暴露一个 VNC 端口。
 # ---------------------------------------------------------------------------
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         chromium \
         xvfb \
-        x11vnc \
-        novnc \
-        websockify \
         openbox \
-        xdotool \
         fonts-noto-cjk \
         fonts-liberation \
         curl \
@@ -86,7 +81,7 @@ RUN chmod +x /app/docker/entrypoint.sh
 # 构建期冒烟测试（缺一即构建失败，确保镜像自包含、运行期无需联网安装）：
 #   1) import app 会立即 mount StaticFiles，静态资源缺失即构建失败
 #   2) 注册机所需的全部运行时组件已预装：Chromium / Xvfb / 窗口管理器 /
-#      VNC / noVNC / websockify / 中文字体 / DrissionPage
+#      中文字体 / DrissionPage
 #   3) Chromium 真实拉起一次（--version），排除装上了却跑不起来的情况
 # 数据库目录用临时路径，避免与后面 /data 的属主设置产生顺序耦合。
 RUN QODER_DATA_DIR=/tmp/smoke-data python -c "\
@@ -100,10 +95,9 @@ assert (base / 'static' / 'assets').is_dir(), 'assets/ missing'; \
 import DrissionPage; \
 print('[smoke] DrissionPage ok'); \
 print('[smoke] static assets resolvable')" \
-    && for bin in Xvfb openbox x11vnc websockify curl tini; do \
+    && for bin in Xvfb openbox curl tini; do \
            command -v "$bin" >/dev/null 2>&1 || { echo "[smoke] MISSING binary: $bin"; exit 1; }; \
        done \
-    && test -f /usr/share/novnc/vnc.html \
     && find /usr/share/fonts -iname '*CJK*' -print -quit | grep -q . \
     && test -x "${QODER_CHROMIUM_PATH}" \
     && "${QODER_CHROMIUM_PATH}" --version \
@@ -118,8 +112,8 @@ RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin qoder && \
 USER qoder
 
 VOLUME ["/data"]
-# 5050 网关；6080 noVNC（观察注册机桌面）
-EXPOSE 5050 6080
+# 5050 网关（人机验证通过控制台内嵌的远程浏览器完成）
+EXPOSE 5050
 
 # /console 无开关，最稳定
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \

@@ -9,8 +9,6 @@ services:
     restart: unless-stopped
     ports:
       - "5050:5050"
-      # noVNC：浏览器打开 http://localhost:6080/vnc.html 操作注册机滑块
-      - "6080:6080"
     # Chromium 多进程渲染需要更大的 /dev/shm，否则页面易崩溃
     shm_size: "1gb"
     environment:
@@ -23,32 +21,26 @@ services:
       QODER_ENABLE_DOCUMENTS: "1"
       QODER_ENABLE_LANDING: "1"
       QODER_DATA_DIR: /data
-      # ---- 远程浏览器（注册机人机验证，推荐）----
-      # 在控制台 Register 页签直接查看/操作浏览器，无需 VNC
+      # ---- 远程浏览器：人机验证在控制台内完成，不开放 VNC ----
       QODER_REMOTE_BROWSER: "${QODER_REMOTE_BROWSER:-1}"
       QODER_REMOTE_BROWSER_FPS: "${QODER_REMOTE_BROWSER_FPS:-8}"
       QODER_REMOTE_BROWSER_QUALITY: "${QODER_REMOTE_BROWSER_QUALITY:-60}"
-      # ---- 虚拟桌面（可选后备方案）----
-      # 默认关闭：优先使用上面的远程浏览器
-      QODER_ENABLE_VNC: "${QODER_ENABLE_VNC:-0}"
-      # VNC 访问密码；留空则每次启动随机生成并打印到日志
-      QODER_VNC_PASSWORD: "${QODER_VNC_PASSWORD:-}"
       QODER_SCREEN: "${QODER_SCREEN:-1440x900x24}"
       # ---- 浏览器 ----
       QODER_CHROMIUM_PATH: /usr/bin/chromium
       # 保持有头模式：headless 无法完成滑块验证
       QODER_CHROMIUM_HEADLESS: "0"
-      # ---- 临时邮箱（注册机用）----
-      # auto: 配了 CF_TEMP_EMAIL_BASE 用 cloudflare，否则回退 yyds
-      QODER_MAIL_PROVIDER: "${QODER_MAIL_PROVIDER:-auto}"
-      CF_TEMP_EMAIL_BASE: "${CF_TEMP_EMAIL_BASE:-}"
-      CF_TEMP_EMAIL_ADMIN_PASSWORD: "${CF_TEMP_EMAIL_ADMIN_PASSWORD:-}"
-      CF_TEMP_EMAIL_SITE_PASSWORD: "${CF_TEMP_EMAIL_SITE_PASSWORD:-}"
-      CF_TEMP_EMAIL_DOMAIN: "${CF_TEMP_EMAIL_DOMAIN:-}"
-      CF_TEMP_EMAIL_CF_TOKEN: "${CF_TEMP_EMAIL_CF_TOKEN:-}"
-      YYDS_API_KEY: "${YYDS_API_KEY:-}"
+      # ---- 临时邮箱 ----
+      # 推荐在控制台「注册机」页签在线配置（写入 SQLite，改完立即生效）。
+      # 以下环境变量仅作为首次部署的默认值 / 回退，可按需取消注释。
+      # QODER_MAIL_PROVIDER: "auto"
+      # CF_TEMP_EMAIL_BASE: "https://mail.example.com"
+      # CF_TEMP_EMAIL_ADMIN_PASSWORD: ""
+      # CF_TEMP_EMAIL_SITE_PASSWORD: ""
+      # CF_TEMP_EMAIL_DOMAIN: ""
+      # YYDS_API_KEY: ""
     volumes:
-      # SQLite 持久化
+      # SQLite 持久化（含控制台里配置的邮箱设置）
       - qodergate-data:/data
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5050/console"]

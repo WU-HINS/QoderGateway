@@ -52,6 +52,6 @@ FastAPI 会直接服务编译后的 `index.html`、`console.html`、`docs.html` 
 
 `Dockerfile` 为多阶段构建：Node 阶段编译前端，Python 阶段安装网关并拷入前端产物。构建期会执行冒烟测试，验证 `StaticFiles` 挂载的静态资源可解析。
 
-镜像包含注册机所需的 Chromium 与 Xvfb。人机验证在有头浏览器中人工完成，默认通过 `remotebrowser.py` 的 CDP 画面桥在 Web 控制台内直接操作（无需 VNC）；设置 `QODER_ENABLE_VNC=1` 可改用传统 VNC。
+镜像包含注册机所需的 Chromium 与 Xvfb。人机验证在有头浏览器中人工完成，默认通过 `remotebrowser.py` 的 CDP 画面桥在 Web 控制台内直接操作（无需 VNC）；容器不安装也不暴露 VNC。
 
 仓库的 GitHub Actions 工作流使用原生 amd64 与 arm64 runner 分别构建，再合并为多架构 manifest 推送到 GHCR。

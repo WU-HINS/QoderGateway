@@ -52,6 +52,6 @@ FastAPI serves the compiled `index.html`, `console.html`, `docs.html` and static
 
 The `Dockerfile` is a multi-stage build: a Node stage compiles the frontend, and a Python stage installs the gateway and copies the assets in. A build-time smoke test asserts the `StaticFiles` mount resolves.
 
-The image bundles Chromium and Xvfb for the registrar. The CAPTCHA is solved by hand in a headed browser, by default through the CDP frame bridge in `remotebrowser.py` directly inside the Web console (no VNC); set `QODER_ENABLE_VNC=1` to use classic VNC instead.
+The image bundles Chromium and Xvfb for the registrar. The CAPTCHA is solved by hand in a headed browser, by default through the CDP frame bridge in `remotebrowser.py` directly inside the Web console (no VNC); VNC is neither installed nor exposed.
 
 The GitHub Actions workflow builds on native amd64 and arm64 runners, then merges both into a multi-arch manifest pushed to GHCR.

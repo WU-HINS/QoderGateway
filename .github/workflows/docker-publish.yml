@@ -79,7 +79,8 @@ jobs:
           fi
 
           # 镜像必须预装注册机所需的全部运行时组件（缺一即运行期失败）
-          for pkg in chromium xvfb x11vnc novnc websockify openbox xdotool \
+          # 不包含 VNC：人机验证由控制台的远程浏览器完成（CDP 画面穿透）
+          for pkg in chromium xvfb openbox \
                      fonts-noto-cjk fonts-liberation curl tini procps; do
             if ! grep -qE "^ +$pkg( |$)" Dockerfile; then
               echo "::error::Dockerfile 缺少预装依赖: $pkg"
@@ -88,8 +89,12 @@ jobs:
           done
 
           # 预装校验必须真实执行（而非只声明）
-          grep -q 'test -f /usr/share/novnc/vnc.html' Dockerfile
           grep -q 'QODER_CHROMIUM_PATH}" --version' Dockerfile
+          # 不应再引入 VNC 依赖（已由控制台远程浏览器取代）
+          if grep -qE '^ +(x11vnc|novnc|websockify) ' Dockerfile; then
+            echo "::error::Dockerfile 不应再安装 VNC 组件"
+            exit 1
+          fi
 
           # GHCR 要求仓库路径全小写。若直接使用 github.repository 拼镜像名，
           # 含大写的仓库（如 QoderGateway）会被 docker 以 invalid reference format 拒绝。

@@ -123,8 +123,6 @@ docker run -d --name qodergate \
   -v qodergate-data:/data \
   -e QODER_ADMIN_PASSWORD=your-strong-password \
   -e QODER_PROXY=http://host.docker.internal:7890 \
-  -e CF_TEMP_EMAIL_BASE=https://mail.example.com \
-  -e CF_TEMP_EMAIL_ADMIN_PASSWORD=your-cf-admin-password \
   ghcr.io/wu-hins/qodergateway:latest
 ```
 
@@ -142,7 +140,6 @@ docker compose up -d
 | Chromium 153（Debian 官方包，amd64/arm64 均有） | 注册机浏览器 |
 | Xvfb | 虚拟 X 显示（有头 Chromium 必需） |
 | openbox | 轻量窗口管理器 |
-| x11vnc + noVNC + websockify | 可选后备：VNC 方式操作桌面 |
 | fonts-noto-cjk | 中文页面渲染 |
 | DrissionPage（`[registrar]` extra） | 浏览器自动化 |
 | 前端产物（Landing / Console / Docs） | 构建阶段编译进镜像 |
@@ -166,18 +163,23 @@ docker run -d --name qodergate \
 
 在控制台 **Register** 页签启动注册机，页面会出现「远程浏览器」面板。等滑块出现时，直接在面板画面上拖动即可完成验证——**不需要打开 VNC，也不需要额外端口**。
 
-实现方式：DrissionPage 本身就是通过 CDP 驱动 Chromium 的，这里复用同一条调试通道，把 `Page.captureScreenshot` 的画面经 WebSocket 推给前端 `<canvas>`，并把鼠标/键盘事件用 `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent` 回放。容器内仍会启动 Xvfb（有头 Chromium 需要 X display），但默认不启动 VNC。
+实现方式：DrissionPage 本身就是通过 CDP 驱动 Chromium 的，这里复用同一条调试通道，把 `Page.captureScreenshot` 的画面经 WebSocket 推给前端 `<canvas>`，并把鼠标/键盘事件用 `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent` 回放。容器内会启动 Xvfb（有头 Chromium 需要 X display），但**不安装也不暴露 VNC**。
 
 - 帧率与画质可调：`QODER_REMOTE_BROWSER_FPS`（默认 8）、`QODER_REMOTE_BROWSER_QUALITY`（默认 60）
 - 关闭该功能：`QODER_REMOTE_BROWSER=0`
-- 需要传统 VNC 时：设 `QODER_ENABLE_VNC=1` 并映射 `6080` 端口
 - 必须加 `--shm-size=1g`：默认 64MB 的 `/dev/shm` 会导致 Chromium 渲染进程崩溃
 
 > **安全提示**：远程浏览器等同于把注册机浏览器的完全控制权交给控制台使用者（可访问该浏览器中的所有已登录会话）。请务必修改默认管理员密码，不要将控制台暴露到公网。
 
 ## 临时邮箱 / Temp Mail
 
-注册机需要一个能收验证码的临时邮箱后端，通过 `QODER_MAIL_PROVIDER` 选择：
+注册机需要一个能收验证码的临时邮箱后端。
+
+**推荐直接在控制台配置**：Register 页签 →「临时邮箱配置」，填写后保存即生效，
+无需重启服务。设置写入本地 SQLite；敏感项（密码/Token）在界面上以掩码显示，
+不会回传明文，留空表示保持原值。环境变量仅作为首次部署的默认值/回退。
+
+后端通过 `QODER_MAIL_PROVIDER`（或控制台的下拉框）选择：
 
 | 取值 | 说明 |
 |------|------|
@@ -212,7 +214,7 @@ docker run -d --name qodergate \
 | `QODER_ENABLE_LANDING` | 是否启用 Landing Page | `1` |
 | `QODER_PAT` | 首次启动时自动导入的 PAT | 空 |
 | `QODER_DATA_DIR` | 数据目录（SQLite 位置） | `~/.qoder` |
-| `QODER_MAIL_PROVIDER` | 临时邮箱后端：`auto` / `cloudflare` / `yyds` | `auto` |
+| `QODER_MAIL_PROVIDER` | 临时邮箱后端（控制台可覆盖）：`auto` / `cloudflare` / `yyds` | `auto` |
 | `CF_TEMP_EMAIL_BASE` | cloudflare_temp_email 部署地址 | 空 |
 | `CF_TEMP_EMAIL_ADMIN_PASSWORD` | cloudflare_temp_email 管理员密码 | 空 |
 | `CF_TEMP_EMAIL_SITE_PASSWORD` | 站点私有密码（`x-custom-auth`） | 空 |
@@ -225,8 +227,6 @@ docker run -d --name qodergate \
 | `QODER_REMOTE_BROWSER` | 控制台内嵌远程浏览器（免 VNC） | `1` |
 | `QODER_REMOTE_BROWSER_FPS` | 远程浏览器帧率上限（1-30） | `8` |
 | `QODER_REMOTE_BROWSER_QUALITY` | 远程浏览器 JPEG 画质（10-95） | `60` |
-| `QODER_ENABLE_VNC` | 是否额外启动 VNC 后备方案 | `0` |
-| `QODER_VNC_PASSWORD` | VNC 访问密码 | 随机生成 |
 | `QODER_SCREEN` | 虚拟屏分辨率 | `1440x900x24` |
 
 ## 项目结构 / Project Structure

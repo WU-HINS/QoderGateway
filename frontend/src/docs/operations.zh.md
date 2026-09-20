@@ -50,19 +50,17 @@ Linux 上需加 `--add-host=host.docker.internal:host-gateway`。
 
 ## 临时邮箱
 
-注册机需要一个收验证码的邮箱后端，由 `QODER_MAIL_PROVIDER` 选择 `auto` / `cloudflare` / `yyds`。
+注册机需要一个收验证码的邮箱后端。**推荐在控制台里配置**：Register 页签 →「临时邮箱配置」，
+填写后保存即生效，无需重启服务。设置写入本地 SQLite（位于 `/data`，随数据卷持久化）。
+
+- 后端由下拉框选择：`auto` / `cloudflare` / `yyds`
+- 敏感项（管理员密码、站点密码、Token）在界面上以掩码显示，不会回传明文；留空表示保持原值
+- 保存后点「测试连接」会真实创建一个临时邮箱，用于确认配置可用
+- 环境变量（`CF_TEMP_EMAIL_*`、`YYDS_API_KEY`）仍可作为首次部署的默认值，控制台保存过的值优先
 
 推荐自建 [cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)：
-
-```bash
--e QODER_MAIL_PROVIDER=cloudflare \
--e CF_TEMP_EMAIL_BASE=https://mail.example.com \
--e CF_TEMP_EMAIL_ADMIN_PASSWORD=your-admin-password
-```
-
-配置 `ADMIN_PASSWORDS` 后走 `/admin/new_address`，可绕过 Turnstile 与"禁止匿名创建"限制。
-
-若站点启用了 `SITE_PASSWORD`，需额外设置 `CF_TEMP_EMAIL_SITE_PASSWORD`。
+在其 `wrangler.toml` 配置 `ADMIN_PASSWORDS` 后，本项目会走 `/admin/new_address`，
+可绕过 Turnstile 与「禁止匿名创建」限制；若站点启用了 `SITE_PASSWORD`，把该密码填入「站点密码」即可。
 
 ## 容器内运行注册机
 
@@ -79,11 +77,10 @@ docker run -d --name qodergate \
 
 在控制台 **Register** 页签启动注册机，页面出现「远程浏览器」面板后，等滑块出现直接在画面上拖动即可，**无需 VNC、无需额外端口**。
 
-实现：复用 DrissionPage 的 CDP 调试通道，用 `Page.captureScreenshot` 取画面经 WebSocket 推给前端 canvas，鼠标/键盘事件通过 `Input.dispatch*` 回放。容器仍启动 Xvfb（有头 Chromium 需要 X display），默认不启动 VNC。
+实现：复用 DrissionPage 的 CDP 调试通道，用 `Page.captureScreenshot` 取画面经 WebSocket 推给前端 canvas，鼠标/键盘事件通过 `Input.dispatch*` 回放。容器仍启动 Xvfb（有头 Chromium 需要 X display），**不安装也不暴露 VNC**。
 
 - `QODER_REMOTE_BROWSER_FPS`（默认 8）、`QODER_REMOTE_BROWSER_QUALITY`（默认 60）可调帧率与画质
 - `QODER_REMOTE_BROWSER=0` 关闭该功能
-- 需要传统 VNC：`QODER_ENABLE_VNC=1` 并映射 `6080` 端口
 - **必须加 `--shm-size=1g`**：默认 64MB 的 `/dev/shm` 会让 Chromium 渲染进程崩溃
 - 容器内 Chromium 以 `--no-sandbox` 运行（容器通常无 `CAP_SYS_ADMIN`），无需 root
 
